@@ -1,0 +1,9 @@
+torch
+torchvision
+gymnasium
+mujoco # or pybullet
+numpy
+opencv-python
+openai # For GPT-4V or DeepSeek API compatibility
+pyyaml
+wandb # For logging training metrics
