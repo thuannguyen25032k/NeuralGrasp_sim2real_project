@@ -1,0 +1,12 @@
+.git
+.gitmodules
+to_delete/
+data/
+*.npz
+*.ply
+*.pth
+*.ckpt
+**/__pycache__
+**/*.egg-info
+**/*.pyc
+**/*.pyo
