@@ -13,7 +13,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y \
-        build-essential git wget curl ca-certificates ninja-build unzip ffmpeg \
+        build-essential git wget curl ca-certificates ninja-build unzip ffmpeg colmap \
         # OpenGL / display stack
         libgl1-mesa-glx libgl1-mesa-dri libgles2-mesa \
         libglvnd0 libglvnd-dev libgl1 libglx0 libegl1 \
@@ -29,16 +29,11 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 # Use EGL (offscreen) as fallback when no X display is available
 ENV PYOPENGL_PLATFORM=egl
 
-# ── Create Python 3.10 virtural environment with uv ───────────────────────────────
+# ── Create Python 3.10 virtual environment with uv ──────────
 WORKDIR /app
 COPY ./ ./
 
-
-# Initialise submodules when building from a git clone that still has them
-# (no-op if the COPY already brought the files)
-RUN git submodule update --init --recursive
-
-# ── Python 3.10 + local project venv (standard style) ───────────────────────
+# ── Python 3.10 + local project venv (standard style) ───────
 RUN uv python install 3.10 \
     && uv venv --python 3.10 /app/.venv
 
@@ -48,14 +43,15 @@ ENV PATH="/app/.venv/bin:${PATH}"
 # ── Bootstrap packaging tools ────────────────────────────────
 RUN uv pip install --upgrade pip setuptools wheel packaging
 
+# ── NumPy pin early to avoid torch ABI issues during build ───
+RUN uv pip install "numpy<2"
+
 # ── PyTorch (CUDA 11.6 build) ────────────────────────────────
 RUN uv pip install \
     --extra-index-url https://download.pytorch.org/whl/cu116 \
     torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1
 
 # ── Patch torch 1.13's cpp_extension.py ──────────────────────
-# torch==1.13 does `from pkg_resources import packaging` which can fail
-# during metadata hooks; use standalone packaging module instead.
 RUN TORCH_DIR=$(python -c "import torch, os; print(os.path.dirname(torch.__file__))") \
     && sed -i \
        's/from pkg_resources import packaging/import packaging/' \
@@ -64,6 +60,13 @@ RUN TORCH_DIR=$(python -c "import torch, os; print(os.path.dirname(torch.__file_
 # ── CUDA arch flags (covers Turing / Ampere / older cards) ───
 ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6+PTX"
 ENV FORCE_CUDA=1
+
+# Force GCC/CUDA toolchain for torch CUDA extensions
+ENV CC=/usr/bin/gcc
+ENV CXX=/usr/bin/g++
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
 # ── CUDA extension submodules ─────────────────────────────────
 RUN uv pip install --no-build-isolation \
@@ -95,10 +98,8 @@ RUN uv pip install --no-build-isolation submodules/simple-knn/
 
 # ── Project requirements & package ───────────────────────────
 RUN uv pip install -r requirements.txt
-RUN uv pip install -e .
 
 # ── Final numpy guard ─────────────────────────────────────────
-# Force numpy back to <2 in case any package above upgraded it.
 RUN uv pip install --force-reinstall "numpy<2"
 
 # ── Default entry-point ───────────────────────────────────────

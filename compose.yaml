@@ -1,0 +1,42 @@
+services:
+  neuralgrasp:
+    image: neuralgrasp:uv
+    container_name: neuralgrasp
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+
+    # Adjust if your project path inside image is different
+    working_dir: /app
+
+    environment:
+      DISPLAY: ":4"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+      NVIDIA_VISIBLE_DEVICES: "all"
+
+    stdin_open: true
+    tty: true
+
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - .:/app/
+
+    ports:
+      - "2503:6001"
+
+    devices:
+      - /dev/dri/card0:/dev/dri/card0
+      - /dev/dri/card1:/dev/dri/card1
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/renderD129:/dev/dri/renderD129
+
+    # Docker Compose v2 GPU support
+    gpus: all
+
+    # command:
+    #   - python
+    #   - scripts/launch_nodes.py
+    #   - --robot
+    #   - sim_ur_pybullet_apple_interactive
+    #   - --robot_name
+    #   - robot_iphone
