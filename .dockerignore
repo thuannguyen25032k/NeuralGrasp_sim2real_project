@@ -1,12 +1,23 @@
 .git
-.gitmodules
-to_delete/
-data/
-*.npz
-*.ply
-*.pth
-*.ckpt
-**/__pycache__
-**/*.egg-info
+.gitignore
+**/__pycache__/
 **/*.pyc
 **/*.pyo
+**/*.pyd
+**/.DS_Store
+
+# datasets, logs, outputs
+outputs/
+data/
+logs/
+ManiGaussian_results/
+wandb/
+checkpoints/
+.venv/
+pyproject.toml
+uv.lock
+
+# heavy build artifacts
+**/build/
+**/dist/
+**/*.egg-info/

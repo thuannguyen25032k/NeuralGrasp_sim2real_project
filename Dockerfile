@@ -1,107 +1,128 @@
-# ============================================================
-# NeuralGrasp Docker Image (uv version)
-# Based on CUDA 11.6 + Ubuntu 20.04 to support gcc-10 and the
-# CUDA extensions required by diff-gaussian-rasterization and
-# simple-knn (which break on Ubuntu 22.04+ / gcc-12+).
-# ============================================================
-FROM nvidia/cuda:11.6.2-devel-ubuntu20.04
-
+FROM nvidia/cuda:11.7.1-cudnn8-devel-ubuntu20.04
 # Install uv binary directly from official image
 COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 
 # ── System packages ──────────────────────────────────────────
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
-    && apt-get install -y \
-        build-essential git wget curl ca-certificates ninja-build unzip ffmpeg colmap \
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get install -y --no-install-recommends software-properties-common \
+    && add-apt-repository -y ppa:ubuntu-toolchain-r/test \
+    && apt-get -o Acquire::Retries=5 update \
+    && apt-get install -y --fix-missing \
+        build-essential clang git wget curl ca-certificates ninja-build unzip ffmpeg colmap \
+        libstdc++6 xvfb \
         # OpenGL / display stack
-        libgl1-mesa-glx libgl1-mesa-dri libgles2-mesa \
-        libglvnd0 libglvnd-dev libgl1 libglx0 libegl1 \
+        libglm-dev libgl1-mesa-glx libgl1-mesa-dri libgles2-mesa \
+        libglvnd0 libglvnd-dev libgl1 libglx0 libegl1 libnvidia-gl-470-server\
         libglib2.0-0 libsm6 libxrender1 libxext6 libx11-6 \
         # PyBullet / Open3D GUI dependencies
         freeglut3-dev libglu1-mesa libxi-dev libxmu-dev \
+    && apt-get purge -y software-properties-common \
+    && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell NVIDIA container toolkit to expose graphics + display capabilities
-ENV NVIDIA_DRIVER_CAPABILITIES=all
+# NVIDIA / OpenGL / CUDA env
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 ENV NVIDIA_VISIBLE_DEVICES=all
-# Use EGL (offscreen) as fallback when no X display is available
 ENV PYOPENGL_PLATFORM=egl
+
+ENV CUDA_HOME=/usr/local/cuda-11.7
+ENV PATH=${CUDA_HOME}/bin:/app/.venv/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+ENV CC=/usr/bin/gcc
+ENV CXX=/usr/bin/g++
+ENV CUDAHOSTCXX=/usr/bin/g++
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6+PTX"
+ENV XDG_RUNTIME_DIR=/tmp/runtime-root
+
+RUN ln -sfn /usr/local/cuda-11.7 /usr/local/cuda && \
+    mkdir -p /tmp/runtime-root && chmod 700 /tmp/runtime-root
 
 # ── Create Python 3.10 virtual environment with uv ──────────
 WORKDIR /app
-COPY ./ ./
 
-# ── Python 3.10 + local project venv (standard style) ───────
-RUN uv python install 3.10 \
-    && uv venv --python 3.10 /app/.venv
+# Copy only dependency manifests first if available
+COPY . /app/
 
-# Standard venv activation style for Docker
+# ── Python 3.9 + local project venv (standard style) ───────
+RUN uv python install 3.9 \
+    && uv venv --python 3.9 /app/.venv
+
+    # Standard venv activation style for Docker
 ENV PATH="/app/.venv/bin:${PATH}"
 
-# ── Bootstrap packaging tools ────────────────────────────────
-RUN uv pip install --upgrade pip setuptools wheel packaging
+# ── Bootstrap core Python deps (cache-friendly grouped install) ─────────────
+RUN uv pip install --no-cache-dir \
+    torch==2.0.0+cu117 torchvision==0.15.0+cu117 torchaudio==2.0.0+cu117 \
+    --extra-index-url https://download.pytorch.org/whl/cu117 && \
+    uv pip install --no-cache-dir \
+    "setuptools==61.1.0" wheel "packaging==23.2" \
+    dotmap pyhocon chardet opencv-python-headless gpustat ipdb sentencepiece \
+    xformers==0.0.18 && \
+    uv pip install --no-cache-dir "numpy==1.23.5" && \
+    uv pip install --no-cache-dir -r requirements.txt
 
-# ── NumPy pin early to avoid torch ABI issues during build ───
-RUN uv pip install "numpy<2"
+RUN uv pip install --no-cache-dir torchmetrics==0.6.0
 
-# ── PyTorch (CUDA 11.6 build) ────────────────────────────────
-RUN uv pip install \
-    --extra-index-url https://download.pytorch.org/whl/cu116 \
-    torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1
+# The codebase (and some third_party deps) import the legacy `pytorch_lightning.metrics.*` API.
+# Pin a compatible PyTorch Lightning 1.x to match torchmetrics==0.6.0.
+RUN uv pip install --no-cache-dir --no-build-isolation "pytorch-lightning==1.5.10"
 
-# ── Patch torch 1.13's cpp_extension.py ──────────────────────
-RUN TORCH_DIR=$(python -c "import torch, os; print(os.path.dirname(torch.__file__))") \
-    && sed -i \
-       's/from pkg_resources import packaging/import packaging/' \
-       "${TORCH_DIR}/utils/cpp_extension.py"
+# visdom setup.py imports pkg_resources; avoid isolated build env surprises
+RUN uv pip install --no-cache-dir --no-build-isolation visdom
 
-# ── CUDA arch flags (covers Turing / Ampere / older cards) ───
-ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6+PTX"
-ENV FORCE_CUDA=1
+# 1. Install pytorch3d dependencies (as in instructions)
+# Clone first to keep sources in a separate layer
+RUN git clone https://github.com/facebookresearch/pytorch3d.git /tmp/pytorch3d
 
-# Force GCC/CUDA toolchain for torch CUDA extensions
-ENV CC=/usr/bin/gcc
-ENV CXX=/usr/bin/g++
-ENV CUDA_HOME=/usr/local/cuda
-ENV PATH="/usr/local/cuda/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+# Ensure packaging/setuptools/wheel are recent (fixes metadata build issues)
+# RUN conda install -n manigaussian -y -c fvcore -c iopath -c conda-forge fvcore iopath
+RUN uv pip install --no-cache-dir --no-build-isolation /tmp/pytorch3d
 
-# ── CUDA extension submodules ─────────────────────────────────
-RUN uv pip install --no-build-isolation \
-        submodules/gaussian-splatting-wrapper/gaussian_splatting/submodules/diff-gaussian-rasterization
+# 2. Install CLIP and open-clip
+RUN git clone https://github.com/openai/CLIP.git /tmp/CLIP
+RUN uv pip install --no-cache-dir -e /tmp/CLIP
+RUN uv pip install --no-cache-dir open-clip-torch
 
-RUN uv pip install --no-build-isolation \
-        submodules/gaussian-splatting-wrapper/gaussian_splatting/submodules/simple-knn \
-        submodules/gaussian-splatting-wrapper/gaussian_splatting/submodules/fused-ssim
+# 3. Download coppeliasim (for PyRep and RLBench) --- IGNORE ---
+# --- CoppeliaSim must exist before building PyRep ---
+RUN tar -xvf /app/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz -C /opt \
+    && ln -sfn /opt/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04 /opt/CoppeliaSim
 
-# ── Pure-Python / easy submodules ────────────────────────────
-RUN uv pip install \
-        submodules/pybullet-URDF-models \
-        submodules/pybullet-playground-wrapper/ \
-        submodules/ghalton
+ENV COPPELIASIM_ROOT=/opt/CoppeliaSim
+ENV LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${COPPELIASIM_ROOT}
+ENV QT_QPA_PLATFORM_PLUGIN_PATH=${COPPELIASIM_ROOT}
 
-RUN uv pip install -e submodules/gaussian-splatting-wrapper
-RUN uv pip install -e submodules/gello_software
+# Install detectron2 + ODISE
+RUN git clone https://github.com/facebookresearch/detectron2.git /tmp/detectron2
+RUN uv pip install --no-cache-dir --no-build-isolation /tmp/detectron2
+RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/ODISE
 
-# Skip hardware/GUI-only packages that can't build headless in Docker:
-#   PyQt6, pyrealsense2, ur-rtde, pure-python-adb, xarm, xarm-python-sdk, pyspacemouse
-RUN grep -vE '^\s*(PyQt6|pyrealsense2|ur-rtde|pure-python-adb|xarm|xarm-python-sdk|pyspacemouse)' \
-        submodules/gello_software/requirements.txt \
-    > /tmp/gello_requirements.filtered.txt \
-    && uv pip install -r /tmp/gello_requirements.filtered.txt
+# Install third-party local packages
+RUN uv pip install --no-cache-dir --no-build-isolation -r /app/third_party/PyRep/requirements.txt
+# RUN uv pip install --no-cache-dir cffi
+RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/PyRep
+RUN uv pip install --no-cache-dir --no-build-isolation -r /app/third_party/RLBench/requirements.txt
+RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/RLBench
+RUN uv pip install --no-cache-dir --no-build-isolation -r /app/third_party/YARR/requirements.txt
+RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/YARR
 
-RUN uv pip install -e submodules/gello_software/third_party/DynamixelSDK/python
+# Fix some possible problems
+RUN uv pip install --no-cache-dir opencv-python-headless
+RUN uv pip install --no-cache-dir "numpy==1.23.5"
 
-RUN uv pip install --no-build-isolation submodules/simple-knn/
+# Install gaussian splatting renderer submodules
+RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/gaussian-splatting/submodules/diff-gaussian-rasterization
+RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/gaussian-splatting/submodules/simple-knn
 
-# ── Project requirements & package ───────────────────────────
-RUN uv pip install -r requirements.txt
+# Install Lightning Fabric
+# NOTE: Do not install `lightning==2.x` here; it can conflict with the legacy `pytorch-lightning` API
+# used by repo dependencies (e.g. `pytorch_lightning.metrics`).
+# RUN uv pip install --no-cache-dir --no-build-isolation lightning==2.0.9.post0
+RUN uv pip install --no-cache-dir --no-build-isolation transformers==4.30.2
+RUN uv pip install --no-cache-dir --no-build-isolation wandb
+# Use the project venv by default in shell sessions
+RUN echo "export PATH=/app/.venv/bin:\$PATH" >> /root/.bashrc
 
-# ── Final numpy guard ─────────────────────────────────────────
-RUN uv pip install --force-reinstall "numpy<2"
-
-# ── Default entry-point ───────────────────────────────────────
-ENTRYPOINT ["/bin/bash", "-lc"]
-CMD ["bash"]
+CMD ["/bin/bash", "-lc", "python -V && nvidia-smi || true && bash"]

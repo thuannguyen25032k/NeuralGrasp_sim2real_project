@@ -1,12 +1,12 @@
 services:
-  neuralgrasp:
-    image: neuralgrasp:uv
-    container_name: neuralgrasp
+  manigaussian:
+    image: manigaussian:cu117
+    container_name: manigaussian
     build:
       context: .
       dockerfile: ./Dockerfile
 
-    # Adjust if your project path inside image is different
+    # Project path inside container
     working_dir: /app
 
     environment:
@@ -16,13 +16,15 @@ services:
 
     stdin_open: true
     tty: true
+    restart: unless-stopped
 
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - .:/app/
+      - manigaussian_venv:/app/.venv
 
     ports:
-      - "2503:6001"
+      - "2403:6001"
 
     devices:
       - /dev/dri/card0:/dev/dri/card0
@@ -33,10 +35,8 @@ services:
     # Docker Compose v2 GPU support
     gpus: all
 
-    # command:
-    #   - python
-    #   - scripts/launch_nodes.py
-    #   - --robot
-    #   - sim_ur_pybullet_apple_interactive
-    #   - --robot_name
-    #   - robot_iphone
+    # Default startup command (interactive shell)
+    command: /bin/bash
+
+volumes:
+  manigaussian_venv:
