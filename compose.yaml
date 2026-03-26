@@ -35,6 +35,10 @@ services:
     # Docker Compose v2 GPU support
     gpus: all
 
+    # # Increase shared memory to avoid Bus error from PyTorch multiprocessing
+    # shm_size: '32gb'
+    # ipc: host
+
     # Default startup command (interactive shell)
     command: /bin/bash
 

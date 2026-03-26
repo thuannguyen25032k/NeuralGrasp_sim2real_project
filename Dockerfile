@@ -120,8 +120,10 @@ RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/gaussian
 # NOTE: Do not install `lightning==2.x` here; it can conflict with the legacy `pytorch-lightning` API
 # used by repo dependencies (e.g. `pytorch_lightning.metrics`).
 # RUN uv pip install --no-cache-dir --no-build-isolation lightning==2.0.9.post0
+RUN uv pip install --no-cache-dir --no-build-isolation "lightning-fabric==1.9.5"
 RUN uv pip install --no-cache-dir --no-build-isolation transformers==4.30.2
-RUN uv pip install --no-cache-dir --no-build-isolation wandb
+RUN uv pip install --no-cache-dir --no-build-isolation wandb==0.13.1
+RUN uv pip install --no-cache-dir --no-build-isolation hydra-core==1.1
 # Use the project venv by default in shell sessions
 RUN echo "export PATH=/app/.venv/bin:\$PATH" >> /root/.bashrc
 
