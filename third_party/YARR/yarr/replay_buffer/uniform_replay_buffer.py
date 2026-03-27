@@ -70,7 +70,7 @@ def invalid_range(cursor, replay_capacity, stack_size, update_horizon):
          for i in range(stack_size + update_horizon)])
 
 
-class UniformReplayBuffer(ReplayBuffer):
+class ManiGaussianFlowReplayBuffer(ReplayBuffer):
     """A simple out-of-graph Replay Buffer.
 
     Stores transitions, state, action, reward, next_state, terminal (and any
@@ -91,6 +91,7 @@ class UniformReplayBuffer(ReplayBuffer):
     def __init__(self,
                  batch_size: int = 32,
                  timesteps: int = 1,
+                 action_horizon: int = 8,
                  replay_capacity: int = int(1e6),
                  update_horizon: int = 1,
                  gamma: float = 0.99,
@@ -183,6 +184,7 @@ class UniformReplayBuffer(ReplayBuffer):
         self._timesteps = timesteps
         self._replay_capacity = replay_capacity
         self._batch_size = batch_size
+        self._action_horizon = action_horizon
         self._update_horizon = update_horizon
         self._gamma = gamma
         self._max_sample_attempts = max_sample_attempts
@@ -245,7 +247,7 @@ class UniformReplayBuffer(ReplayBuffer):
             ReplayElement(ACTION, self._action_shape, self._action_dtype),
             ReplayElement(REWARD, self._reward_shape, self._reward_dtype),
             ReplayElement(TERMINAL, (), np.int8),
-            ReplayElement(TIMEOUT, (), np.bool),
+            ReplayElement(TIMEOUT, (), np.bool_),
         ]
 
         obs_elements = []
@@ -712,7 +714,7 @@ class UniformReplayBuffer(ReplayBuffer):
                 else:
                     # np.argmax of a bool array returns index of the first True.
                     trajectory_length = np.argmax(
-                        trajectory_terminals.astype(np.bool),
+                        trajectory_terminals.astype(np.bool_),
                         0) + 1
 
                 next_state_index = state_index + trajectory_length
@@ -749,6 +751,37 @@ class UniformReplayBuffer(ReplayBuffer):
                                 batch_element] = self._get_element_stack(
                                 store[element.name],
                                 state_index, terminal_stack)
+                    elif element.name == ACTION:
+                        # 1. Find out how many steps we can safely read without hitting the cursor
+                        available_steps = self._action_horizon
+                        if not self.is_full() and (state_index + available_steps > self.cursor()):
+                            available_steps = self.cursor() - state_index
+
+                        # 2. Fetch the raw sequence for the safe available steps
+                        raw_actions = self.get_range(store[ACTION], 
+                                                     state_index, 
+                                                     state_index + available_steps)
+                        
+                        chunk_terminals = self.get_range(self._store[TERMINAL], 
+                                                         state_index, 
+                                                         state_index + available_steps)
+                        
+                        # 3. Padding Case A: The episode terminates within our available steps
+                        if (chunk_terminals > 0).any():
+                            first_terminal_idx = np.argmax(chunk_terminals > 0)
+                            last_valid_action = raw_actions[first_terminal_idx]
+                            # Overwrite everything after the terminal state
+                            raw_actions[first_terminal_idx + 1:] = last_valid_action
+                            
+                        # 4. Padding Case B: We hit the end of the buffer/cursor before filling the horizon
+                        if available_steps < self._action_horizon:
+                            pad_len = self._action_horizon - available_steps
+                            last_action = raw_actions[-1:] # Keep 2D shape [1, dim]
+                            # Repeat the final action to fill the remaining horizon
+                            padding = np.repeat(last_action, pad_len, axis=0)
+                            raw_actions = np.concatenate([raw_actions, padding], axis=0)
+                            
+                        element_array[batch_element] = raw_actions
                     elif element.name == REWARD:
                         # compute discounted sum of rewards in the trajectory.
                         element_array[batch_element] = np.sum(
@@ -786,12 +819,12 @@ class UniformReplayBuffer(ReplayBuffer):
         batch_size = self._batch_size if batch_size is None else batch_size
 
         transition_elements = [
-            ReplayElement(ACTION, (batch_size,) + self._action_shape,
-                          self._action_dtype),
-            ReplayElement(REWARD, (batch_size,) + self._reward_shape,
-                          self._reward_dtype),
+            # ReplayElement(ACTION, (batch_size,) + self._action_shape,
+            #               self._action_dtype),
+            ReplayElement(ACTION, (batch_size, self._action_horizon) + self._action_shape, self._action_dtype),
+            ReplayElement(REWARD, (batch_size,) + self._reward_shape, self._reward_dtype),
             ReplayElement(TERMINAL, (batch_size,), np.int8),
-            ReplayElement(TIMEOUT, (batch_size,), np.bool),
+            ReplayElement(TIMEOUT, (batch_size,), np.bool_),
             ReplayElement(INDICES, (batch_size,), np.int32),
         ]
 
