@@ -70,7 +70,7 @@ def invalid_range(cursor, replay_capacity, stack_size, update_horizon):
          for i in range(stack_size + update_horizon)])
 
 
-class ManiGaussianFlowReplayBuffer(ReplayBuffer):
+class UniformReplayBuffer(ReplayBuffer):
     """A simple out-of-graph Replay Buffer.
 
     Stores transitions, state, action, reward, next_state, terminal (and any
@@ -91,7 +91,6 @@ class ManiGaussianFlowReplayBuffer(ReplayBuffer):
     def __init__(self,
                  batch_size: int = 32,
                  timesteps: int = 1,
-                 action_horizon: int = 8,
                  replay_capacity: int = int(1e6),
                  update_horizon: int = 1,
                  gamma: float = 0.99,
@@ -184,7 +183,6 @@ class ManiGaussianFlowReplayBuffer(ReplayBuffer):
         self._timesteps = timesteps
         self._replay_capacity = replay_capacity
         self._batch_size = batch_size
-        self._action_horizon = action_horizon
         self._update_horizon = update_horizon
         self._gamma = gamma
         self._max_sample_attempts = max_sample_attempts
@@ -751,37 +749,6 @@ class ManiGaussianFlowReplayBuffer(ReplayBuffer):
                                 batch_element] = self._get_element_stack(
                                 store[element.name],
                                 state_index, terminal_stack)
-                    elif element.name == ACTION:
-                        # 1. Find out how many steps we can safely read without hitting the cursor
-                        available_steps = self._action_horizon
-                        if not self.is_full() and (state_index + available_steps > self.cursor()):
-                            available_steps = self.cursor() - state_index
-
-                        # 2. Fetch the raw sequence for the safe available steps
-                        raw_actions = self.get_range(store[ACTION], 
-                                                     state_index, 
-                                                     state_index + available_steps)
-                        
-                        chunk_terminals = self.get_range(self._store[TERMINAL], 
-                                                         state_index, 
-                                                         state_index + available_steps)
-                        
-                        # 3. Padding Case A: The episode terminates within our available steps
-                        if (chunk_terminals > 0).any():
-                            first_terminal_idx = np.argmax(chunk_terminals > 0)
-                            last_valid_action = raw_actions[first_terminal_idx]
-                            # Overwrite everything after the terminal state
-                            raw_actions[first_terminal_idx + 1:] = last_valid_action
-                            
-                        # 4. Padding Case B: We hit the end of the buffer/cursor before filling the horizon
-                        if available_steps < self._action_horizon:
-                            pad_len = self._action_horizon - available_steps
-                            last_action = raw_actions[-1:] # Keep 2D shape [1, dim]
-                            # Repeat the final action to fill the remaining horizon
-                            padding = np.repeat(last_action, pad_len, axis=0)
-                            raw_actions = np.concatenate([raw_actions, padding], axis=0)
-                            
-                        element_array[batch_element] = raw_actions
                     elif element.name == REWARD:
                         # compute discounted sum of rewards in the trajectory.
                         element_array[batch_element] = np.sum(
@@ -791,6 +758,40 @@ class ManiGaussianFlowReplayBuffer(ReplayBuffer):
                         element_array[batch_element] = is_terminal_transition
                     elif element.name == INDICES:
                         element_array[batch_element] = state_index
+                    elif element.name == ACTION: # Handle ACTION separately for chunking
+                        action_horizon = 16
+                        
+                        # Calculate the end index for the chunk
+                        chunk_end_index = state_index + action_horizon
+                        
+                        # Get the raw chunk from the store
+                        raw_chunk = self.get_range(store[ACTION], state_index, chunk_end_index)
+                        
+                        # Check for terminal states within the chunk to determine true length
+                        terminals = self.get_range(store[TERMINAL], state_index, chunk_end_index)
+                        
+                        # If a terminal state (-1) is found, the episode ended early
+                        if np.any(terminals == -1):
+                             # Find where the episode actually ends
+                             actual_length = np.argmax(terminals == -1) 
+                             
+                             # Slice the valid actions
+                             valid_actions = raw_chunk[:actual_length]
+                             
+                             # Pad by repeating the last valid action
+                             padding_length = action_horizon - actual_length
+                             if actual_length > 0:
+                                 last_action = valid_actions[-1:]
+                                 padding = np.repeat(last_action, padding_length, axis=0)
+                                 action_chunk = np.concatenate([valid_actions, padding], axis=0)
+                             else:
+                                 # Edge case: state_index itself is a terminal state (shouldn't happen with valid transitions)
+                                 action_chunk = np.zeros((action_horizon, 3), dtype=np.float32)
+                        else:
+                             action_chunk = raw_chunk
+                             
+                        element_array[batch_element] = action_chunk
+                        
                     elif element.name in store.keys():
                         element_array[batch_element] = (
                             store[element.name][state_index])
@@ -817,12 +818,14 @@ class ManiGaussianFlowReplayBuffer(ReplayBuffer):
           signature: A namedtuple describing the method's return type signature.
         """
         batch_size = self._batch_size if batch_size is None else batch_size
+        action_horizon = 16
+        actual_action_dim = 3
 
         transition_elements = [
-            # ReplayElement(ACTION, (batch_size,) + self._action_shape,
-            #               self._action_dtype),
-            ReplayElement(ACTION, (batch_size, self._action_horizon) + self._action_shape, self._action_dtype),
-            ReplayElement(REWARD, (batch_size,) + self._reward_shape, self._reward_dtype),
+            ReplayElement(ACTION, (batch_size, action_horizon, actual_action_dim),
+                          self._action_dtype),
+            ReplayElement(REWARD, (batch_size,) + self._reward_shape,
+                          self._reward_dtype),
             ReplayElement(TERMINAL, (batch_size,), np.int8),
             ReplayElement(TIMEOUT, (batch_size,), np.bool_),
             ReplayElement(INDICES, (batch_size,), np.int32),

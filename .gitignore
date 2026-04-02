@@ -10,6 +10,7 @@ test/
 .vscode
 output
 build
+*.pkl
 
 ####
 tmp_dir/

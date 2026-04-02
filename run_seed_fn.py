@@ -102,6 +102,46 @@ def run_seed(
             )
 
         agent = manigaussian_bc.launch_utils.create_agent(cfg)
+
+    elif cfg.method.name == 'ManiGaussianFlow':
+        # 1. Import your new agent's folder
+        from agents import manigaussian_flow_bc
+        
+        # 2. Create the replay buffer (it will automatically use the 16x3 chunking we hacked into uniform_replay_buffer.py earlier)
+        replay_buffer = manigaussian_flow_bc.launch_utils.create_replay(
+            cfg.replay.batch_size, cfg.replay.timesteps,
+            cfg.replay.prioritisation,
+            cfg.replay.task_uniform,
+            replay_path if cfg.replay.use_disk else None,
+            cams, cfg.method.voxel_sizes,
+            cfg.rlbench.camera_resolution,
+            cfg=cfg)
+        
+        # 3. Load or Fill the replay buffer
+        if cfg.replay.use_disk and (os.path.exists(replay_path) and len(os.listdir(replay_path)) > 1):
+            logging.info(f"Found replay files in {replay_path}. Loading...")
+            replay_files = [os.path.join(replay_path, f) for f in os.listdir(replay_path) if f.endswith('.replay')]
+            for replay_file in tqdm(replay_files, desc="Processing replay files"):
+                with open(replay_file, 'rb') as f:
+                    try:
+                        replay_data = pickle.load(f)
+                        replay_buffer._add(replay_data)
+                    except pickle.UnpicklingError as e:
+                        logging.error(f"Error unpickling file {replay_file}: {e}")
+        else:
+            manigaussian_flow_bc.launch_utils.fill_multi_task_replay(
+                cfg, obs_config, 0,
+                replay_buffer, tasks, cfg.rlbench.demos,
+                cfg.method.demo_augmentation, cfg.method.demo_augmentation_every_n,
+                cams, cfg.rlbench.scene_bounds,
+                cfg.method.voxel_sizes, cfg.method.bounds_offset,
+                cfg.method.rotation_resolution, cfg.method.crop_augmentation,
+                keypoint_method=cfg.method.keypoint_method,
+                fabric=fabric,
+            )
+
+        # 4. Create the Flow agent using your modified launch_utils
+        agent = manigaussian_flow_bc.launch_utils.create_agent(cfg)
     
     elif cfg.method.name == 'PERACT_BC':
         from agents import peract_bc

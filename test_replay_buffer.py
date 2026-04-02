@@ -1,6 +1,6 @@
 # A quick test script to put in your ManiGaussian root folder
 import numpy as np
-from third_party.YARR.yarr.replay_buffer.uniform_replay_buffer import ManiGaussianFlowReplayBuffer
+from third_party.YARR.yarr.replay_buffer.manigaussian_flow_replay_buffer import ManiGaussianFlowReplayBuffer
 import os
 import torch.distributed as dist
 
