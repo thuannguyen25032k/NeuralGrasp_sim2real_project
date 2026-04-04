@@ -29,7 +29,7 @@ replay:
     task_uniform: True # uniform sampling of tasks for multi-task buffers
     use_disk: True
     path: '/tmp/arm/replay' # only used when use_disk is True.
-    max_parallel_processes: 8
+    max_parallel_processes: 10
 
 evaluation: # for online evaluation
     eval_freq: 10000
@@ -59,7 +59,7 @@ framework:
     start_seed: 0
     load_existing_weights: False
     num_weights_to_keep: 60 # older checkpoints will be deleted chronologically
-    num_workers: 0
+    num_workers: 4
     record_every_n: 5
     # wandb setting
     use_wandb: True

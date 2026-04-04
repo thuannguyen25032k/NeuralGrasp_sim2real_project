@@ -126,7 +126,7 @@ class NeRFTaskRecorder(object):
         self.t = 0
 
         from termcolor import colored
-        print(colored('[NeRFTaskRecorder] num_views: {}'.format(num_views), 'red'))
+        print(colored('[NeRFTaskRecorder] num_views: {}'.format(num_views), 'cyan'))
 
         # create a progress bar
         from tqdm import tqdm

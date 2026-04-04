@@ -114,6 +114,23 @@ class NeuralRenderer(nn.Module):
             return grad
         return hook
 
+    def _batched_pca(self, feat, in_channels):
+        """
+        Vectorised batched PCA via a single torch.linalg.svd call.
+        feat  : [bs, in_channels, H, W]
+        return: [bs, d_embed, H, W]
+        """
+        bs, C, H, W = feat.shape
+        q = np.maximum(6, self.d_embed)
+        A = feat.reshape(bs, C, -1).permute(0, 2, 1)  # [bs, H*W, C]
+        # mean-centre per sample for numerical stability
+        A = A - A.mean(dim=1, keepdim=True)
+        # single batched SVD — much faster than a Python for-loop
+        _, _, Vh = torch.linalg.svd(A, full_matrices=False)  # Vh: [bs, min(H*W,C), C]
+        V = Vh[:, :q, :].permute(0, 2, 1)                    # [bs, C, q]
+        proj = torch.bmm(A, V)[:, :, :self.d_embed]          # [bs, H*W, d_embed]
+        return proj.permute(0, 2, 1).reshape(bs, self.d_embed, H, W)
+
     def extract_foundation_model_feature(self, gt_rgb, lang_goal):
         """
         we use the last layer of the diffusion feature extractor
@@ -135,16 +152,8 @@ class NeuralRenderer(nn.Module):
             used_feature_idx = -1  
             gt_embed = feature_list[used_feature_idx]   # [bs,512,128,128]
 
-            # NOTE: dimensionality reduction with PCA, which is used to satisfy the output dimension of the Gaussian Renderer
-            bs = gt_rgb.shape[0]
-            A = gt_embed.reshape(bs, 512, -1).permute(0, 2, 1)  # [bs, 128*128, 512]
-            gt_embed_list = []
-            for i in range(bs):
-                U, S, V = torch.pca_lowrank(A[i], q=np.maximum(6, self.d_embed))
-                reconstructed_embed = torch.matmul(A[i], V[:, :self.d_embed])
-                gt_embed_list.append(reconstructed_embed)
-
-            gt_embed = torch.stack(gt_embed_list, dim=0).permute(0, 2, 1).reshape(bs, self.d_embed, 128, 128)
+            # NOTE: dimensionality reduction with batched PCA
+            gt_embed = self._batched_pca(gt_embed, 512)
             return gt_embed
         
         elif self.model_name == "dinov2":
@@ -152,15 +161,8 @@ class NeuralRenderer(nn.Module):
             feature = self.feature_extractor(batched_input)
             gt_embed = F.interpolate(feature, size=(128, 128), mode='bilinear', align_corners=False)    # [b, 1024, 128, 128]
 
-            # NOTE: dimensionality reduction with PCA, which is used to satisfy the output dimension of the Gaussian Renderer
-            bs = gt_rgb.shape[0]
-            A = gt_embed.reshape(bs, 1024, -1).permute(0, 2, 1)  # [bs, 128*128, 1024]
-            gt_embed_list = []
-            for i in range(bs):
-                U, S, V = torch.pca_lowrank(A[i], q=np.maximum(6, self.d_embed))
-                reconstructed_embed = torch.matmul(A[i], V[:, :self.d_embed])
-                gt_embed_list.append(reconstructed_embed)
-            gt_embed = torch.stack(gt_embed_list, dim=0).permute(0, 2, 1).reshape(bs, self.d_embed, 128, 128)
+            # NOTE: dimensionality reduction with batched PCA
+            gt_embed = self._batched_pca(gt_embed, 1024)
             return gt_embed
         else:
             return None

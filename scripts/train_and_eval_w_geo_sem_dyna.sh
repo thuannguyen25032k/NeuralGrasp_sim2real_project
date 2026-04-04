@@ -34,7 +34,7 @@ demo=20
 lambda_embed=0.01
 lambda_dyna=0.1
 lambda_reg=0.0
-render_freq=2000
+render_freq=5000
 
 python_exec="/app/.venv/bin/python"
 if [ ! -x "${python_exec}" ]; then
@@ -63,6 +63,8 @@ train_cmd=(
 	"method.neural_renderer.lambda_reg=${lambda_reg}"
 	"method.neural_renderer.foundation_model_name=diffusion"
 	"method.neural_renderer.use_dynamic_field=True"
+	"framework.num_workers=20"
+	"replay.max_parallel_processes=20"
 )
 
 echo "Running training in foreground (no tmux)." 

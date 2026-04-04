@@ -82,13 +82,32 @@ def run_seed(
         if cfg.replay.use_disk and (os.path.exists(replay_path) and len(os.listdir(replay_path)) > 1):  # default: True
             logging.info(f"Found replay files in {replay_path}. Loading...")
             replay_files = [os.path.join(replay_path, f) for f in os.listdir(replay_path) if f.endswith('.replay')]
-            for replay_file in tqdm(replay_files, desc="Processing replay files"):  # NOTE: Experimental, please check your replay buffer carefully.
+
+            # Load replay files in parallel using a thread pool (I/O bound: pickle reads)
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import multiprocessing
+
+            def _load_one(replay_file):
                 with open(replay_file, 'rb') as f:
+                    return pickle.load(f)
+
+            num_io_workers = min(16, multiprocessing.cpu_count(), len(replay_files))
+            loaded = [None] * len(replay_files)
+            with ThreadPoolExecutor(max_workers=num_io_workers) as executor:
+                future_to_idx = {executor.submit(_load_one, f): i for i, f in enumerate(replay_files)}
+                for future in tqdm(as_completed(future_to_idx), total=len(replay_files), desc="Loading replay files"):
+                    idx = future_to_idx[future]
                     try:
-                        replay_data = pickle.load(f)
+                        loaded[idx] = future.result()
+                    except Exception as e:
+                        logging.error(f"Error loading replay file {replay_files[idx]}: {e}")
+
+            for replay_data in tqdm(loaded, desc="Adding to replay buffer"):
+                if replay_data is not None:
+                    try:
                         replay_buffer._add(replay_data)
-                    except pickle.UnpicklingError as e:
-                        logging.error(f"Error unpickling file {replay_file}: {e}")
+                    except Exception as e:
+                        logging.error(f"Error adding replay data: {e}")
         else:
             manigaussian_bc.launch_utils.fill_multi_task_replay(
                 cfg, obs_config, 0,

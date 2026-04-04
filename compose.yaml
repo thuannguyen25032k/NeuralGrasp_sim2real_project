@@ -35,9 +35,9 @@ services:
     # Docker Compose v2 GPU support
     gpus: all
 
-    # # Increase shared memory to avoid Bus error from PyTorch multiprocessing
-    # shm_size: '32gb'
-    # ipc: host
+    # Increase shared memory size to prevent SIGBUS when PyTorch multiprocessing
+    # shares tensors across eval workers (default Docker /dev/shm is only 64MB).
+    shm_size: "32gb"
 
     # Default startup command (interactive shell)
     command: /bin/bash
