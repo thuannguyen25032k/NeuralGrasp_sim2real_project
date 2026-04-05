@@ -245,7 +245,7 @@ class UniformReplayBuffer(ReplayBuffer):
             ReplayElement(ACTION, self._action_shape, self._action_dtype),
             ReplayElement(REWARD, self._reward_shape, self._reward_dtype),
             ReplayElement(TERMINAL, (), np.int8),
-            ReplayElement(TIMEOUT, (), np.bool),
+            ReplayElement(TIMEOUT, (), np.bool_),
         ]
 
         obs_elements = []
@@ -690,6 +690,7 @@ class UniformReplayBuffer(ReplayBuffer):
         if batch_size is None:
             batch_size = self._batch_size
         with self._lock:
+            # get indices
             if indices is None:
                 indices = self.sample_index_batch(batch_size)
             assert len(indices) == batch_size
@@ -712,7 +713,7 @@ class UniformReplayBuffer(ReplayBuffer):
                 else:
                     # np.argmax of a bool array returns index of the first True.
                     trajectory_length = np.argmax(
-                        trajectory_terminals.astype(np.bool),
+                        trajectory_terminals.astype(np.bool_),
                         0) + 1
 
                 next_state_index = state_index + trajectory_length
@@ -733,10 +734,9 @@ class UniformReplayBuffer(ReplayBuffer):
                 terminal_stack_tp1 = self.get_terminal_stack(
                     next_state_index % self._replay_capacity)
 
-                # Fill the contents of each array in the sampled batch.
+                # Fill the contents of each array in the sampled batch (batch_arrays).
                 assert len(transition_elements) == len(batch_arrays)
-                for element_array, element in zip(batch_arrays,
-                                                  transition_elements):
+                for element_array, element in zip(batch_arrays, transition_elements):
                     if element.is_observation:
                         if element.name.endswith('tp1'):
                             element_array[

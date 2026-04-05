@@ -31,7 +31,16 @@ class GSPointCloudRegresser(nn.Module):
             in_features=sum(out_channels),
             out_features=sum(out_channels),
         )
+
     def forward(self, x):
+        """run x through the activation function and the MLP layer
+
+        Args:
+            x (Tensor): 
+
+        Returns:
+            tensor: 
+        """
         return self.out(self.activation(x, beta=100))
 
 class GeneralizableGSEmbedNet(nn.Module):
@@ -193,68 +202,61 @@ class GeneralizableGSEmbedNet(nn.Module):
         N is batch of points
         NS is number of input views
 
-        Predict gaussian parameter maps
+        This function takes points as input to predicts the gaussian parameters.
         """
 
-        SB, N, _ = data['xyz'].shape
+        batch_size, N, _ = data['xyz'].shape
         NS = self.num_views_per_obj # 1
 
+        # normalize the data
         canon_xyz = self.world_to_canonical(data['xyz'])    # [1,N,3], min:-2.28, max:1.39
 
-        # volumetric sampling
+        # volumetric sampling of the decoder features
         point_latent = self.sample_in_canonical_voxel(canon_xyz, data['dec_fts']) # [bs, N, 128]->[bs, 128, N]
         point_latent = point_latent.reshape(-1, self.d_latent)  # (SB * NS * B, latent)  [N, 128]
 
+        # concatenate points with position features
         if self.use_xyz:    # True
             z_feature = canon_xyz.reshape(-1, 3)  # (SB*B, 3)
-
         if self.use_code:    # True
-            # Positional encoding (no viewdirs)
             z_feature = self.code(z_feature)    # [N, 39]
-
         latent = torch.cat((point_latent, z_feature), dim=-1) # [N, 128+39]
 
-        # Camera frustum culling stuff, currently disabled
+        # run through the encoder
         combine_index = None
         dim_size = None
-        # backbone
         latent, _ = self.encoder(
             latent,
             combine_inner_dims=(self.num_views_per_obj, N),
             combine_index=combine_index,
             dim_size=dim_size,
             language_embed=data['lang'],
-            batch_size=SB,
+            batch_size=batch_size,
             )   # 26
-
         latent = latent.reshape(-1, N, self.d_out)  # [1, N, d_out]
 
-        ## regress gaussian parms
+        # regress gaussian parms
         split_network_outputs = self.gs_parm_regresser(latent) # [1, N, (3, 1, 3, 4, 3, 9)]
         split_network_outputs = split_network_outputs.split(self.split_dimensions_with_offset, dim=-1)
-        
         xyz_maps, opacity_maps, scale_maps, rot_maps, features_dc_maps, feature_maps = split_network_outputs[:6]
         if self.max_sh_degree > 0:
             features_rest_maps = split_network_outputs[6]
 
-        # spherical function head
+        # post process, spherical function head
         features_dc_maps = features_dc_maps.unsqueeze(2) #.transpose(2, 1).contiguous().unsqueeze(2) # [B, H*W, 1, 3]
         features_rest_maps = features_rest_maps.reshape(*features_rest_maps.shape[:2], -1, 3) # [B, H*W, 3, 3]
         sh_out = torch.cat([features_dc_maps, features_rest_maps], dim=2)  # [B, H*W, 4, 3]
-
         scale_maps = self.scaling_activation(scale_maps)    # exp
         scale_maps = torch.clamp_max(scale_maps, 0.05)
-
         data['xyz_maps'] = data['xyz'] + xyz_maps   # [B, N, 3]
-        data['sh_maps'] = sh_out    # [B, N, 4, 3]
+        data['sh_maps'] = sh_out    # spherical harmonics [B, N, 4, 3]
         data['rot_maps'] = self.rotation_activation(rot_maps, dim=-1)
         data['scale_maps'] = scale_maps
         data['opacity_maps'] = self.opacity_activation(opacity_maps)
         data['feature_maps'] = feature_maps # [B, N, 3]
 
-        # Dynamic Modeling: predict next gaussian maps
-        if self.use_dynamic_field: #and data['step'] >= self.warm_up:
-
+        # predict next gaussian maps (Dynamic Modeling)
+        if self.use_dynamic_field: 
             if not self.use_semantic_feature:
                 # dyna_input: (d_latent, d_in)
                 dyna_input = torch.cat((
@@ -286,16 +288,18 @@ class GeneralizableGSEmbedNet(nn.Module):
             if self.use_action:
                 dyna_input = torch.cat((dyna_input, data['action'].repeat(N, 1)), dim=-1)   # action detach
 
+            # forward
             next_split_network_outputs, _ = self.gs_deformation_field(
                 dyna_input,
                 combine_inner_dims=(self.num_views_per_obj, N),
                 combine_index=combine_index,
                 dim_size=dim_size,
                 language_embed=data['lang'],
-                batch_size=SB,
+                batch_size=batch_size,
                 )
             next_xyz_maps, next_rot_maps = next_split_network_outputs.split([3, 4], dim=-1)
 
+            # format
             data['next']['xyz_maps'] = data['xyz_maps'].detach() + next_xyz_maps
             data['next']['sh_maps'] = data['sh_maps'].detach()
             data['next']['rot_maps'] = self.rotation_activation(data['rot_maps'].detach() + next_rot_maps, dim=-1)

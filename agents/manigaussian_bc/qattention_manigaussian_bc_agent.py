@@ -197,34 +197,61 @@ class QFunction(nn.Module):
                 nerf_next_target_rgb=None, nerf_next_target_pose=None, nerf_next_target_depth=None,
                 nerf_next_target_camera_intrinsic=None,
                 gt_embed=None, step=None, action=None):
-        '''
-        Return Q-functions and neural rendering loss
-        '''
+        """This function takes the rgb detph and pcb to predict actions. 
+        It also compute the rendering loss.
 
-        b = rgb_pcd[0][0].shape[0]
+        Args:
+            rgb_pcd (_type_): image RGB 
+            depth (_type_): depth image
+            proprio (_type_): robot internal proprioception
+            pcd (_type_): point cloud
+            camera_extrinsics (_type_): _description_
+            camera_intrinsics (_type_): _description_
+            lang_goal_emb (_type_): _description_
+            lang_token_embs (_type_): language tokens from the language instruction
+            bounds (_type_, optional): _description_. Defaults to None.
+            prev_bounds (_type_, optional): _description_. Defaults to None.
+            prev_layer_voxel_grid (_type_, optional): _description_. Defaults to None.
+            use_neural_rendering (bool, optional): _description_. Defaults to False.
+            nerf_target_rgb (_type_, optional): _description_. Defaults to None.
+            nerf_target_depth (_type_, optional): _description_. Defaults to None.
+            nerf_target_pose (_type_, optional): _description_. Defaults to None.
+            nerf_target_camera_intrinsic (_type_, optional): _description_. Defaults to None.
+            lang_goal (_type_, optional): _description_. Defaults to None.
+            nerf_next_target_rgb (_type_, optional): _description_. Defaults to None.
+            nerf_next_target_pose (_type_, optional): _description_. Defaults to None.
+            nerf_next_target_depth (_type_, optional): _description_. Defaults to None.
+            nerf_next_target_camera_intrinsic (_type_, optional): _description_. Defaults to None.
+            gt_embed (_type_, optional): _description_. Defaults to None.
+            step (_type_, optional): _description_. Defaults to None.
+            action (_type_, optional): _description_. Defaults to None.
+
+        Returns:
+            _type_: Return Q-functions and neural rendering loss
+        """            
+
+        batch_size = rgb_pcd[0][0].shape[0]
 
         pcd_flat = torch.cat(
-            [p.permute(0, 2, 3, 1).reshape(b, -1, 3) for p in pcd], 1)  # [1, 16384, 3]
+            [p.permute(0, 2, 3, 1).reshape(batch_size, -1, 3) for p in pcd], 1)  # [1, 16384, 3]
         
         # flatten RGBs and Pointclouds
         rgb = [rp[0] for rp in rgb_pcd]
         feat_size = rgb[0].shape[1] # 3
 
         flat_imag_features = torch.cat(
-            [p.permute(0, 2, 3, 1).reshape(b, -1, feat_size) for p in rgb], 1)  # [1, 16384, 3]
+            [p.permute(0, 2, 3, 1).reshape(batch_size, -1, feat_size) for p in rgb], 1)  # [1, 16384, 3]
 
         # construct voxel grid
-        voxel_grid, voxel_density = self._voxelizer.coords_to_bounding_voxel_grid(
-            pcd_flat, coord_features=flat_imag_features, coord_bounds=bounds, return_density=True)
-
-        # swap to channels fist
+        voxel_grid, voxel_density = self._voxelizer.coords_to_bounding_voxel_grid(pcd_flat, coord_features=flat_imag_features, coord_bounds=bounds, 
+                                                                                  return_density=True)
         voxel_grid = voxel_grid.permute(0, 4, 1, 2, 3).detach() # Bx10x100x100x100
 
         # batch bounds if necessary
-        if bounds.shape[0] != b:
-            bounds = bounds.repeat(b, 1)
+        if bounds.shape[0] != batch_size:
+            bounds = bounds.repeat(batch_size, 1)
 
-        # forward pass
+        # forward pass, predict actions
         q_trans, \
         q_rot_and_grip,\
         q_ignore_collisions,\

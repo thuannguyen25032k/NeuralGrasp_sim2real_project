@@ -261,6 +261,7 @@ class NeuralRenderer(nn.Module):
         '''
         bs = rgb.shape[0]
 
+        # create a dict
         data = self.encode_data(
             rgb=rgb, depth=depth, pcd=pcd, focal=focal, c=c, lang_goal=None, tgt_pose=gt_pose, tgt_intrinsic=gt_intrinsic,
             dec_fts=dec_fts, lang=language, next_tgt_pose=next_gt_pose, next_tgt_intrinsic=next_gt_intrinsic, 
@@ -270,9 +271,9 @@ class NeuralRenderer(nn.Module):
         render_novel = None
         next_render_novel = None
         render_embed = None
-        gt_embed = None
 
         # create gt feature from foundation models
+        gt_embed = None
         with torch.no_grad():
             gt_embed = self.extract_foundation_model_feature(gt_rgb, lang_goal)
 
