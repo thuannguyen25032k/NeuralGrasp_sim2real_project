@@ -117,26 +117,26 @@ class OfflineTrainRunner():
             return starting_epoch
 
     def preprocess_data(self, data_iter, SILENT=True):
-        # try:
-        sampled_batch = next(data_iter) # may raise StopIteration
-        # print error and restart data iter
-        # except Exception as e:
-        #     cprint(e, 'red')
-        #     # FIXME: this is a pretty bad hack...
-        #     cprint("restarting data iter...", 'red')
-        #     return self.preprocess_data(data_iter)
-        
+        """
+        This fucntion takes an iterator and create a batch of data. 
+        """
+        # add main data
+        sampled_batch = next(data_iter) # may raise StopIteration        
         batch = {k: v.to(self._train_device) for k, v in sampled_batch.items() if type(v) == torch.Tensor}
+
+        # add nerf data
         batch['nerf_multi_view_rgb'] = sampled_batch['nerf_multi_view_rgb'] # [bs, 1, 21]
         batch['nerf_multi_view_depth'] = sampled_batch['nerf_multi_view_depth']
         batch['nerf_multi_view_camera'] = sampled_batch['nerf_multi_view_camera'] # must!!!
         batch['lang_goal'] = sampled_batch['lang_goal']
 
+        # add future nerf data
         if 'nerf_next_multi_view_rgb' in sampled_batch:
             batch['nerf_next_multi_view_rgb'] = sampled_batch['nerf_next_multi_view_rgb']
             batch['nerf_next_multi_view_depth'] = sampled_batch['nerf_next_multi_view_depth']
             batch['nerf_next_multi_view_camera'] = sampled_batch['nerf_next_multi_view_camera']
         
+        # squeeze if needed
         if len(batch['nerf_multi_view_rgb'].shape) == 3:
             batch['nerf_multi_view_rgb'] = batch['nerf_multi_view_rgb'].squeeze(1)
             batch['nerf_multi_view_depth'] = batch['nerf_multi_view_depth'].squeeze(1)
@@ -147,6 +147,7 @@ class OfflineTrainRunner():
                 batch['nerf_next_multi_view_depth'] = batch['nerf_next_multi_view_depth'].squeeze(1)
                 batch['nerf_next_multi_view_camera'] = batch['nerf_next_multi_view_camera'].squeeze(1)
         
+        # process again if no nerf data
         if batch['nerf_multi_view_rgb'] is None or batch['nerf_multi_view_rgb'][0,0] is None:
             if not SILENT:
                 cprint('batch[nerf_multi_view_rgb] is None. find next data iter', 'red')
