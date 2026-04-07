@@ -1,7 +1,7 @@
 services:
-  manigaussian:
-    image: manigaussian:cu117
-    container_name: manigaussian
+  neuralgrasp:
+    image: neuralgrasp:cu117
+    container_name: neuralgrasp
     build:
       context: .
       dockerfile: ./Dockerfile
@@ -21,7 +21,7 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - .:/app/
-      - manigaussian_venv:/app/.venv
+      - neuralgrasp_venv:/app/.venv
 
     ports:
       - "2403:6001"
@@ -46,4 +46,4 @@ services:
     command: /bin/bash
 
 volumes:
-  manigaussian_venv:
+  neuralgrasp_venv:

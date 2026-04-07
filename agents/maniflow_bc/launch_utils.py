@@ -30,9 +30,9 @@ from helpers.preprocess_agent import PreprocessAgent
 from helpers.clip.core.clip import tokenize
 from helpers.language_model import create_language_model
 
-from agents.maniflow.voxel_flow_encoder import VoxelFlowEncoder
-from agents.maniflow.qattention_maniflow_agent import ManiFlowBCAgent
-from agents.maniflow.qattention_stack_agent import ManiFlowStackAgent
+from agents.maniflow_bc.voxel_flow_encoder import VoxelFlowEncoder
+from agents.maniflow_bc.qattention_maniflow_agent import ManiFlowBCAgent
+from agents.maniflow_bc.qattention_stack_agent import ManiFlowStackAgent
 
 import torch
 import multiprocessing as mp

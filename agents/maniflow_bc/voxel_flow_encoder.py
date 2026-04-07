@@ -48,12 +48,12 @@ from helpers.network_utils import (
     SpatialSoftmax3D,
     MultiLayer3DEncoderShallow,
 )
-from agents.maniflow.position_encodings import (
+from agents.maniflow_bc.position_encodings import (
     SinusoidalPosEmb,
     RotaryPositionEncoding3D,
     PositionEmbeddingLearnedMLP,
 )
-from agents.maniflow.transformer_layers import AttentionModule
+from agents.maniflow_bc.transformer_layers import AttentionModule
 
 
 # ---------------------------------------------------------------------------

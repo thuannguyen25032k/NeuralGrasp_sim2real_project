@@ -11,7 +11,7 @@ import torch
 from yarr.agents.agent import Agent, ActResult, Summary
 from termcolor import cprint
 
-from agents.maniflow.qattention_maniflow_agent import ManiFlowBCAgent
+from agents.maniflow_bc.qattention_maniflow_agent import ManiFlowBCAgent
 
 NAME = 'ManiFlowStackAgent'
 

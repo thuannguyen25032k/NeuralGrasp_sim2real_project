@@ -1,18 +1,13 @@
 .git
 .gitignore
+.gitmodules
 **/__pycache__/
 **/*.pyc
 **/*.pyo
 **/*.pyd
 **/.DS_Store
 
-# datasets, logs, outputs
-outputs/
-data/
-logs/
-ManiGaussian_results/
-wandb/
-checkpoints/
+
 .venv/
 pyproject.toml
 uv.lock
@@ -21,3 +16,13 @@ uv.lock
 **/build/
 **/dist/
 **/*.egg-info/
+
+# editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# docker artifacts
+compose.yaml
+.dockerignore

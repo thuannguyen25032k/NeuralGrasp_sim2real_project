@@ -1,49 +1,81 @@
-# this script generates demonstrations for multiple tasks in parallel batches.
+# this script generates demonstrations for multiple tasks using a rolling worker pool.
+# As soon as one task slot frees, the next task starts immediately.
 # example:
 #       bash scripts/gen_demonstrations_all.sh
 #
-# Set PARALLEL_TASKS to control how many tasks run simultaneously.
-# Each task already spawns --processes=4 workers internally, so:
-#   total CoppeliaSim instances = PARALLEL_TASKS * 4
-# Tune PARALLEL_TASKS based on available CPU cores and RAM.
+# System: Intel Core Ultra 9 285K (24 cores, no HT), 122 GB RAM, RTX 6000 Ada (48 GB VRAM)
+#   1 task = 2 generators x --processes=4 = 8 CoppeliaSim instances, ~24 GB RAM
+#   MAX_PARALLEL_TASKS=3 -> 24 cores, ~72 GB RAM
 
-# The recommended 10 tasks
+set -euo pipefail
+
 ALL_TASK="close_jar open_drawer sweep_to_dustpan_of_size meat_off_grill turn_tap slide_block_to_color_target put_item_in_drawer reach_and_drag push_buttons stack_blocks stack_cups put_groceries_in_cupboard insert_onto_square_peg place_wine_at_rack_location put_money_in_safe"
 
-PARALLEL_TASKS=4  # number of tasks to run concurrently
-# System: Intel Core Ultra 9 285K (24 cores), 122 GB RAM, RTX 6000 Ada
-# Each task spawns --processes=4 CoppeliaSim workers (~3 GB RAM, 1 core each)
-# 4 tasks x 4 workers = 16 cores, ~48 GB RAM used — safe headroom on this machine
+MAX_PARALLEL_TASKS=3
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 tasks=($ALL_TASK)
 pids=()
+names=()
+FAILED_TASKS=()
 
 for task in "${tasks[@]}"; do
-    echo "### Generating demonstrations for task: $task"
-    bash scripts/gen_demonstrations.sh "$task" &
-    pids+=($!)
-
-    # Once we have PARALLEL_TASKS running, wait for all of them to finish
-    # before starting the next batch
-    if (( ${#pids[@]} >= PARALLEL_TASKS )); then
-        for pid in "${pids[@]}"; do
-            wait "$pid"
-            status=$?
-            if [ $status -ne 0 ]; then
-                echo "WARNING: A task process (PID $pid) exited with status $status"
+    # Wait until a slot is free in the pool.
+    while (( ${#pids[@]} >= MAX_PARALLEL_TASKS )); do
+        new_pids=()
+        new_names=()
+        for idx in "${!pids[@]}"; do
+            pid="${pids[$idx]}"
+            tname="${names[$idx]}"
+            if kill -0 "$pid" 2>/dev/null; then
+                # Still running — keep in pool.
+                new_pids+=("$pid")
+                new_names+=("$tname")
+            else
+                # Finished — harvest exit status.
+                wait "$pid" || true
+                status=$?
+                if [ $status -ne 0 ]; then
+                    echo "WARNING: Task '${tname}' (PID ${pid}) exited with status ${status}"
+                    FAILED_TASKS+=("$tname")
+                else
+                    echo "### Completed: ${tname}"
+                fi
             fi
         done
-        pids=()
-    fi
+        pids=("${new_pids[@]+"${new_pids[@]}"}")
+        names=("${new_names[@]+"${new_names[@]}"}")
+        # If pool still full, back off briefly before polling again.
+        (( ${#pids[@]} >= MAX_PARALLEL_TASKS )) && sleep 1
+    done
+
+    echo "### Starting: ${task}"
+    bash "${SCRIPT_DIR}/gen_demonstrations.sh" "$task" &
+    pids+=($!)
+    names+=("$task")
 done
 
-# Wait for any remaining tasks in the last (possibly partial) batch
-for pid in "${pids[@]}"; do
-    wait "$pid"
+# Drain remaining jobs.
+for idx in "${!pids[@]}"; do
+    pid="${pids[$idx]}"
+    tname="${names[$idx]}"
+    wait "$pid" || true
     status=$?
     if [ $status -ne 0 ]; then
-        echo "WARNING: A task process (PID $pid) exited with status $status"
+        echo "WARNING: Task '${tname}' (PID ${pid}) exited with status ${status}"
+        FAILED_TASKS+=("$tname")
+    else
+        echo "### Completed: ${tname}"
     fi
 done
 
-echo "### All tasks completed."
+echo ""
+echo "### All tasks finished."
+if [ ${#FAILED_TASKS[@]} -gt 0 ]; then
+    echo "FAILED tasks (${#FAILED_TASKS[@]}):"
+    for t in "${FAILED_TASKS[@]}"; do echo "  - $t"; done
+    exit 1
+else
+    echo "All ${#tasks[@]} tasks completed successfully."
+fi

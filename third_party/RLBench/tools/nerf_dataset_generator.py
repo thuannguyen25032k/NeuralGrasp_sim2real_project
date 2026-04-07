@@ -300,10 +300,8 @@ def run(i, lock, task_index, variation_count, results, file_lock, tasks):
                     abort_variation = True
                     break
                 episode_path = os.path.join(episodes_path, EPISODE_FOLDER % ex_idx)
-
-                with file_lock:
-                    save_demo(demo, episode_path)
-                    
+                # Each worker writes to a unique episode_path — no lock needed.
+                save_demo(demo, episode_path, my_variation_count)
                 break
             if abort_variation:
                 break
@@ -400,7 +398,6 @@ def run_all_variations(i, lock, task_index, variation_count, results, file_lock,
         task_env = rlbench_env.get_task(t)
         possible_variations = task_env.variation_count()
 
-        
         # task_recorder = TaskRecorder(task_env, cam_motion, fps=fps)
 
         variation_path = os.path.join(
@@ -415,6 +412,9 @@ def run_all_variations(i, lock, task_index, variation_count, results, file_lock,
 
         for ex_idx in range(FLAGS.episodes_per_task):
             attempts = 10
+            # Bind task_env once per episode so task_recorder always holds
+            # a valid reference; the retry loop must NOT reassign task_env.
+            task_env = rlbench_env.get_task(t)
             # nerf data generation
             task_recorder = NeRFTaskRecorder(task_env, cam_motion, fps=fps, num_views=num_views)
             task_recorder._cam_motion.save_pose()
@@ -422,7 +422,6 @@ def run_all_variations(i, lock, task_index, variation_count, results, file_lock,
             while attempts > 0:
                 try:
                     variation = np.random.randint(possible_variations)
-                    task_env = rlbench_env.get_task(t)
                     task_env.set_variation(variation)
                     descriptions, obs = task_env.reset()
                     task_recorder.record_task_description(descriptions)
@@ -450,22 +449,19 @@ def run_all_variations(i, lock, task_index, variation_count, results, file_lock,
                     tasks_with_problems += problem
                     abort_variation = True
                     break
-                
-                episode_path = os.path.join(episodes_path, EPISODE_FOLDER % ex_idx)
-                with file_lock:
-                    save_demo(demo, episode_path, variation)
 
-                    with open(os.path.join(
-                            episode_path, VARIATION_DESCRIPTIONS), 'wb') as f:
-                        pickle.dump(descriptions, f)
-                    
-                    # ========================================================================
-                    # nerf data generation
-                    # ========================================================================
-                    record_file_path = os.path.join(episode_path, 'nerf_data')
-                    task_recorder.save(record_file_path)
-                    task_recorder._cam_motion.restore_pose()
-                    
+                episode_path = os.path.join(episodes_path, EPISODE_FOLDER % ex_idx)
+                # Each worker writes to a unique episode_path — no lock needed.
+                save_demo(demo, episode_path, variation)
+                with open(os.path.join(
+                        episode_path, VARIATION_DESCRIPTIONS), 'wb') as f:
+                    pickle.dump(descriptions, f)
+                # ============================================================
+                # nerf data generation
+                # ============================================================
+                record_file_path = os.path.join(episode_path, 'nerf_data')
+                task_recorder.save(record_file_path)
+                task_recorder._cam_motion.restore_pose()
                 break
             if abort_variation:
                 break

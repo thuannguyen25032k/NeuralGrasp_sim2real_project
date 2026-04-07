@@ -10,8 +10,8 @@ import os.path as osp
 import warnings
 from termcolor import colored, cprint
 
-from agents.maniflow.utils import PositionalEncoding, visualize_pcd
-from agents.maniflow.resnetfc import ResnetFC
+from agents.maniflow_bc.utils import PositionalEncoding, visualize_pcd
+from agents.maniflow_bc.resnetfc import ResnetFC
 
 from typing import List
 import numpy as np

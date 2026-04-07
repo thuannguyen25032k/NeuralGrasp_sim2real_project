@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 import einops
 
-from agents.maniflow.position_encodings import RotaryPositionEncoding
+from agents.maniflow_bc.position_encodings import RotaryPositionEncoding
 
 
 class MultiheadCustomAttention(nn.MultiheadAttention):

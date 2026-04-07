@@ -1,12 +1,12 @@
 """
 Transformer building blocks for the maniflow denoising head.
 Adapted from 3d_flowmatch_actor/modeling/utils/layers.py — import paths
-updated to agents.maniflow.* and relative imports removed.
+updated to agents.maniflow_bc.* and relative imports removed.
 """
 
 from torch import nn
 
-from agents.maniflow.multihead_custom_attention import MultiheadCustomAttention
+from agents.maniflow_bc.multihead_custom_attention import MultiheadCustomAttention
 
 
 class AdaLN(nn.Module):

@@ -54,6 +54,10 @@ def eval_seed(train_cfg,
         from agents import manigaussian_bc
         train_cfg.method.use_neural_rendering = False # when doing eval, we suppress neural rendering
         agent = manigaussian_bc.launch_utils.create_agent(train_cfg)
+    elif train_cfg.method.name == 'ManiFlow_BC':
+        from agents import maniflow_bc
+        train_cfg.method.use_neural_rendering = False  # when doing eval, we suppress neural rendering
+        agent = maniflow_bc.launch_utils.create_agent(train_cfg)
     else:
         raise ValueError('Method %s does not exists.' % train_cfg.method.name)
 

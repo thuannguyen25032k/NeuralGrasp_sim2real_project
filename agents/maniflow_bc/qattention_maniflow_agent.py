@@ -35,12 +35,12 @@ import PIL.Image as Image
 import transformers
 from helpers.optim.lamb import Lamb
 from torch.nn.parallel import DistributedDataParallel as DDP
-from agents.maniflow.neural_rendering import NeuralRenderer
-from agents.maniflow.utils import visualize_pcd
+from agents.maniflow_bc.neural_rendering import NeuralRenderer
+from agents.maniflow_bc.utils import visualize_pcd
 from helpers.language_model import create_language_model
 
-from agents.maniflow.voxel_flow_encoder import VoxelFlowEncoder
-from agents.maniflow.rf_scheduler import RFScheduler
+from agents.maniflow_bc.voxel_flow_encoder import VoxelFlowEncoder
+from agents.maniflow_bc.rf_scheduler import RFScheduler
 
 import wandb
 from lightning.fabric import Fabric

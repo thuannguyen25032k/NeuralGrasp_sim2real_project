@@ -2,9 +2,9 @@ from torch import nn
 import torch
 
 import torch.autograd.profiler as profiler
-import agents.maniflow.utils as utils
+import agents.maniflow_bc.utils as utils
 from termcolor import colored
-from agents.maniflow.attention import Visual3DLangTransformer
+from agents.maniflow_bc.attention import Visual3DLangTransformer
 
 # Resnet Blocks
 class ResnetBlockFC(nn.Module):

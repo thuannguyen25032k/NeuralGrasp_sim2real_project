@@ -288,8 +288,8 @@ def run(i, lock, task_index, variation_count, results, file_lock, tasks):
                     abort_variation = True
                     break
                 episode_path = os.path.join(episodes_path, EPISODE_FOLDER % ex_idx)
-                with file_lock:
-                    save_demo(demo, episode_path, my_variation_count)
+                # Each worker writes to a unique episode_path — no lock needed.
+                save_demo(demo, episode_path, my_variation_count)
                 break
             if abort_variation:
                 break
@@ -374,7 +374,6 @@ def run_all_variations(i, lock, task_index, variation_count, results, file_lock,
             while attempts > 0:
                 try:
                     variation = np.random.randint(possible_variations)
-                    task_env = rlbench_env.get_task(t)
                     task_env.set_variation(variation)
                     descriptions, obs = task_env.reset()
 
@@ -400,12 +399,11 @@ def run_all_variations(i, lock, task_index, variation_count, results, file_lock,
                     abort_variation = True
                     break
                 episode_path = os.path.join(episodes_path, EPISODE_FOLDER % ex_idx)
-                with file_lock:
-                    save_demo(demo, episode_path, variation)
-
-                    with open(os.path.join(
-                            episode_path, VARIATION_DESCRIPTIONS), 'wb') as f:
-                        pickle.dump(descriptions, f)
+                # Each worker writes to a unique episode_path — no lock needed.
+                save_demo(demo, episode_path, variation)
+                with open(os.path.join(
+                        episode_path, VARIATION_DESCRIPTIONS), 'wb') as f:
+                    pickle.dump(descriptions, f)
                 break
             if abort_variation:
                 break

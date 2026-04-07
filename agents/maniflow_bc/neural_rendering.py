@@ -8,11 +8,11 @@ import torchvision.transforms as T
 from termcolor import colored, cprint
 from dotmap import DotMap
 
-import agents.maniflow.utils as utils
-from agents.maniflow.models_embed import GeneralizableGSEmbedNet
-from agents.maniflow.loss import l1_loss, l2_loss, cosine_loss, ssim
-from agents.maniflow.graphics_utils import getWorld2View2, getProjectionMatrix, focal2fov
-from agents.maniflow.gaussian_renderer import render
+import agents.maniflow_bc.utils as utils
+from agents.maniflow_bc.models_embed import GeneralizableGSEmbedNet
+from agents.maniflow_bc.loss import l1_loss, l2_loss, cosine_loss, ssim
+from agents.maniflow_bc.graphics_utils import getWorld2View2, getProjectionMatrix, focal2fov
+from agents.maniflow_bc.gaussian_renderer import render
 
 import visdom
 import logging
@@ -67,7 +67,7 @@ class NeuralRenderer(nn.Module):
             self.diffusion_preprocess = T.Resize(512, antialias=True)
             cprint("diffusion feature dims: "+str(self.feature_extractor.feature_dims), "yellow")
         elif self.model_name == "dinov2":
-            from agents.maniflow.dino_extractor import VitExtractor
+            from agents.maniflow_bc.dino_extractor import VitExtractor
             import torchvision.transforms as T
             self.feature_extractor = VitExtractor(
                 model_name='dinov2_vitl14',

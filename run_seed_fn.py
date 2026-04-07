@@ -123,8 +123,8 @@ def run_seed(
         agent = manigaussian_bc.launch_utils.create_agent(cfg)
 
     elif cfg.method.name == 'ManiFlow_BC':
-        from agents import maniflow
-        replay_buffer = maniflow.launch_utils.create_replay(
+        from agents import maniflow_bc
+        replay_buffer = maniflow_bc.launch_utils.create_replay(
             cfg.replay.batch_size, cfg.replay.timesteps,
             cfg.replay.prioritisation,
             cfg.replay.task_uniform,
@@ -161,7 +161,7 @@ def run_seed(
                     except Exception as e:
                         logging.error(f"Error adding replay data: {e}")
         else:
-            maniflow.launch_utils.fill_multi_task_replay(
+            maniflow_bc.launch_utils.fill_multi_task_replay(
                 cfg, obs_config, 0,
                 replay_buffer, tasks, cfg.rlbench.demos,
                 cfg.method.demo_augmentation, cfg.method.demo_augmentation_every_n,
@@ -172,7 +172,7 @@ def run_seed(
                 fabric=fabric,
             )
 
-        agent = maniflow.launch_utils.create_agent(cfg)
+        agent = maniflow_bc.launch_utils.create_agent(cfg)
 
     elif cfg.method.name == 'PERACT_BC':
         from agents import peract_bc
