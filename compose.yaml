@@ -37,7 +37,10 @@ services:
 
     # Increase shared memory size to prevent SIGBUS when PyTorch multiprocessing
     # shares tensors across eval workers (default Docker /dev/shm is only 64MB).
-    shm_size: "32gb"
+    # Mounting /dev/shm as tmpfs without a size limit makes it bounded only by
+    # available host RAM (122 GB on this machine).
+    tmpfs:
+      - /dev/shm
 
     # Default startup command (interactive shell)
     command: /bin/bash

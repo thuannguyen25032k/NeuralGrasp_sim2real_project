@@ -121,7 +121,59 @@ def run_seed(
             )
 
         agent = manigaussian_bc.launch_utils.create_agent(cfg)
-    
+
+    elif cfg.method.name == 'ManiFlow_BC':
+        from agents import maniflow
+        replay_buffer = maniflow.launch_utils.create_replay(
+            cfg.replay.batch_size, cfg.replay.timesteps,
+            cfg.replay.prioritisation,
+            cfg.replay.task_uniform,
+            replay_path if cfg.replay.use_disk else None,
+            cams, cfg.method.voxel_sizes,
+            cfg.rlbench.camera_resolution,
+            cfg=cfg)
+
+        if cfg.replay.use_disk and (os.path.exists(replay_path) and len(os.listdir(replay_path)) > 1):
+            logging.info(f"Found replay files in {replay_path}. Loading...")
+            replay_files = [os.path.join(replay_path, f) for f in os.listdir(replay_path) if f.endswith('.replay')]
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import multiprocessing
+
+            def _load_one_mf(replay_file):
+                with open(replay_file, 'rb') as f:
+                    return pickle.load(f)
+
+            num_io_workers = min(16, multiprocessing.cpu_count(), len(replay_files))
+            loaded = [None] * len(replay_files)
+            with ThreadPoolExecutor(max_workers=num_io_workers) as executor:
+                future_to_idx = {executor.submit(_load_one_mf, f): i for i, f in enumerate(replay_files)}
+                for future in tqdm(as_completed(future_to_idx), total=len(replay_files), desc="Loading replay files"):
+                    idx = future_to_idx[future]
+                    try:
+                        loaded[idx] = future.result()
+                    except Exception as e:
+                        logging.error(f"Error loading replay file {replay_files[idx]}: {e}")
+            for replay_data in tqdm(loaded, desc="Adding to replay buffer"):
+                if replay_data is not None:
+                    try:
+                        replay_buffer._add(replay_data)
+                    except Exception as e:
+                        logging.error(f"Error adding replay data: {e}")
+        else:
+            maniflow.launch_utils.fill_multi_task_replay(
+                cfg, obs_config, 0,
+                replay_buffer, tasks, cfg.rlbench.demos,
+                cfg.method.demo_augmentation, cfg.method.demo_augmentation_every_n,
+                cams, cfg.rlbench.scene_bounds,
+                cfg.method.voxel_sizes, cfg.method.bounds_offset,
+                cfg.method.rotation_resolution, cfg.method.crop_augmentation,
+                keypoint_method=cfg.method.keypoint_method,
+                fabric=fabric,
+            )
+
+        agent = maniflow.launch_utils.create_agent(cfg)
+
     elif cfg.method.name == 'PERACT_BC':
         from agents import peract_bc
         replay_buffer = peract_bc.launch_utils.create_replay(

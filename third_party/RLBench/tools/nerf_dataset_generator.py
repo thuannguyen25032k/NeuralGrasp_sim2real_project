@@ -50,8 +50,7 @@ flags.DEFINE_integer('num_views', 50,
                         'Number of views to collect per timestep for nerf.')
 
 def check_and_make(dir):
-    if not os.path.exists(dir):
-        os.makedirs(dir)
+    os.makedirs(dir, exist_ok=True)
 
 
 def save_demo(demo, example_path, variation):
@@ -389,12 +388,14 @@ def run_all_variations(i, lock, task_index, variation_count, results, file_lock,
     # ========================================================================
 
     while True:
-        # with lock:
-        if task_index.value >= num_tasks:
-            print('Process', i, 'finished')
-            break
+        with lock:
+            if task_index.value >= num_tasks:
+                print('Process', i, 'finished')
+                break
+            my_task_index = task_index.value
+            task_index.value += 1
 
-        t = tasks[task_index.value]
+        t = tasks[my_task_index]
 
         task_env = rlbench_env.get_task(t)
         possible_variations = task_env.variation_count()
@@ -469,9 +470,6 @@ def run_all_variations(i, lock, task_index, variation_count, results, file_lock,
             if abort_variation:
                 break
 
-        # with lock:
-        task_index.value += 1
-
     results[i] = tasks_with_problems
     rlbench_env.shutdown()
 
@@ -501,16 +499,17 @@ def main(argv):
     check_and_make(FLAGS.save_path)
 
     if FLAGS.all_variations:
-        # multiprocessing for all_variations not support (for now)
-        run_all_variations(0, lock, task_index, variation_count, result_dict, file_lock, tasks)
+        target_fn = run_all_variations
     else:
-        processes = [Process(
-            target=run, args=(
-                i, lock, task_index, variation_count, result_dict, file_lock,
-                tasks))
-            for i in range(FLAGS.processes)]
-        [t.start() for t in processes]
-        [t.join() for t in processes]
+        target_fn = run
+
+    processes = [Process(
+        target=target_fn, args=(
+            i, lock, task_index, variation_count, result_dict, file_lock,
+            tasks))
+        for i in range(FLAGS.processes)]
+    [t.start() for t in processes]
+    [t.join() for t in processes]
 
     print('Data collection done!')
     for i in range(FLAGS.processes):
