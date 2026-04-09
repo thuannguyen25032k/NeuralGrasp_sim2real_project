@@ -81,7 +81,8 @@ class IndependentEnvRunner(EnvRunner):
               save_metrics,
               cinematic_recorder_cfg,
               novel_command=None,
-              use_eval_demo=True):
+              use_eval_demo=True,
+              wandb_cfg=None):
         multi_task = isinstance(env_config[0], list)
         if multi_task:
             eval_env = CustomMultiTaskRLBenchEnv(
@@ -131,6 +132,7 @@ class IndependentEnvRunner(EnvRunner):
                                                         device_idx,
                                                         save_metrics,
                                                         cinematic_recorder_cfg,
-                                                        novel_command)
+                                                        novel_command,
+                                                        wandb_cfg=wandb_cfg)
     
         

@@ -14,7 +14,7 @@ trimesh==3.9.34
 h5py==3.3.0
 # hydra-core version is pinned to 1.1 in the Dockerfile (final install wins).
 # The sweeper/launcher plugins are kept at a compatible version.
-hydra-core==1.1
+hydra-core==1.2.0
 hydra-optuna-sweeper==1.2.0
 hydra-submitit-launcher==1.2.0
 tqdm

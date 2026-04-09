@@ -18,8 +18,8 @@ xvfb-run -a python nerf_dataset_generator.py \
     --save_path="../../../data/train_data" \
     --image_size=128,128 \
     --renderer=opengl \
-    --episodes_per_task=20 \
-    --processes=4 \
+    --episodes_per_task=100 \
+    --processes=6 \
     --all_variations=True &
 NERF_PID=$!
 
@@ -30,7 +30,7 @@ xvfb-run -a python dataset_generator.py \
     --image_size=128,128 \
     --renderer=opengl \
     --episodes_per_task=25 \
-    --processes=4 \
+    --processes=6 \
     --all_variations=True &
 DATASET_PID=$!
 

@@ -24,7 +24,8 @@ class RFScheduler:
     def __init__(self, noise_sampler: str = "logit_normal",
                  noise_sampler_config: dict = None):
         self.noise_sampler = noise_sampler
-        self.noise_sampler_config = noise_sampler_config or {"mean": 0.0, "std": 1.5}
+        self.noise_sampler_config = noise_sampler_config or {
+            "mean": 0.0, "std": 1.5}
 
     # ------------------------------------------------------------------
     # Inference setup
@@ -60,7 +61,8 @@ class RFScheduler:
                 (num_noise,)
             ).to(device).clamp(max=0.999)
         else:
-            raise NotImplementedError(f"Sampler '{self.noise_sampler}' not implemented.")
+            raise NotImplementedError(
+                f"Sampler '{self.noise_sampler}' not implemented.")
 
     def add_noise(self, original_samples: torch.Tensor,
                   noise: torch.Tensor,
@@ -82,14 +84,15 @@ class RFScheduler:
              timestep_ind: int,
              sample: torch.Tensor):
         """One Euler step:  z_{t'} = z_t - dt * v_theta."""
-        t      = self.timesteps[timestep_ind].to(model_output.device)
+        t = self.timesteps[timestep_ind].to(model_output.device)
         prev_t = self.prev_timesteps[timestep_ind].to(model_output.device)
-        dt     = t - prev_t
+        dt = t - prev_t
         prev_sample = sample - dt * model_output
         return _StepOutput(prev_sample=prev_sample)
 
 
 class _StepOutput:
     """Simple container matching the HuggingFace scheduler API."""
+
     def __init__(self, prev_sample: torch.Tensor):
         self.prev_sample = prev_sample

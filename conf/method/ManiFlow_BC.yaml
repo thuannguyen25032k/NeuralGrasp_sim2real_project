@@ -27,21 +27,61 @@ lang_fusion_type: 'seq'   # 'seq' or 'concat'
 # -----------------------------------------------------------------------
 # Flow-matching head  (Transformer — mirrors 3D FlowMatch Actor)
 # -----------------------------------------------------------------------
+# Architecture overview:
+#   VoxelFlowEncoder:
+#     ├── 3D-CNN voxel encoder  (im_channels output, shared with GS renderer)
+#     ├── Language pre-processor (lang_fusion_type: 'seq' or 'concat')
+#     ├── Voxel → token projection  (AdaptiveAvgPool3d + Linear → embedding_dim)
+#     │     token count = (voxel_sizes / voxel_token_downsample)^3
+#     │     then FPS-subsampled to num_fps_tokens
+#     ├── 3D RoPE positional encoding on voxel token world coords
+#     └── TransformerHead (denoising head):
+#           action query
+#             → cross-attn to lang tokens   (1 layer, no RoPE)
+#             → cross-attn to voxel tokens  (2 layers, 3D RoPE, AdaLN)
+#             → joint self-attn trunk       (num_shared_attn_layers, AdaLN)
+#             → pos head  (2-layer self-attn → Linear → 3)
+#             → rot head  (2-layer self-attn → Linear → 4)
+#             → grip head (Linear → 1)
+#   AdaLN conditioning signal = time_emb(t) + proprio_proj(gripper_state)
+# -----------------------------------------------------------------------
 action_dim: 8             # [x, y, z, qx, qy, qz, qw, gripper]
 
-# Transformer head hyperparameters
-embedding_dim: 120          # Transformer feature dimension (must be divisible by num_attn_heads)
-num_attn_heads: 8           # number of attention heads
-num_shared_attn_layers: 4   # shared self-attention trunk depth
-voxel_token_downsample: 5   # spatial stride: voxel_size/stride^3 tokens (e.g. 100/5 -> 8000 tokens)
-num_fps_tokens: 512         # FPS-subsample voxel tokens to this many before joint self-attn (0=disable)
+# --- Transformer head hyperparameters -----------------------------------
+# embedding_dim: feature dimension for all Transformer layers.
+#   Must be divisible by num_attn_heads.
+#   Larger = more capacity, higher memory/compute cost.
+embedding_dim: 120
 
-denoise_timesteps: 100      # inference denoising steps
+# num_attn_heads: number of attention heads in every AttentionModule.
+#   embedding_dim / num_attn_heads = head dimension (here: 15).
+num_attn_heads: 8
 
-# Legacy MLP stubs — kept for backward-compatibility; not used by the Transformer head
-flow_context_dim: 256
-flow_hidden_dim: 512
-flow_num_layers: 4
+# num_shared_attn_layers: depth of the joint action+voxel self-attention
+#   trunk (AdaLN, 3D RoPE). Mirrors TransformerHead.self_attn depth.
+num_shared_attn_layers: 4
+
+# voxel_token_downsample: spatial stride applied via AdaptiveAvgPool3d
+#   before flattening the 3D-CNN voxel volume into a token sequence.
+#   Token count N = (voxel_size / voxel_token_downsample)^3
+#   e.g. voxel_size=100, stride=5  →  N = 20^3 = 8000 tokens (before FPS).
+voxel_token_downsample: 5
+
+# num_fps_tokens: how many voxel tokens to keep after Farthest Point
+#   Sampling (FPS) — reduces computation from N to M in the self-attn trunk.
+#   Set to 0 to disable FPS and keep all N tokens.
+num_fps_tokens: 512
+
+# denoise_timesteps: number of rectified-flow denoising steps at inference.
+#   Does not affect training (training uses a single random t ~ U[0,1]).
+denoise_timesteps: 100
+
+# --- Legacy MLP stubs (NOT used — kept only for YAML backward-compat) ---
+# These keys were present in an earlier MLP-based prototype.
+# VoxelFlowEncoder accepts them as kwargs but ignores them entirely.
+flow_context_dim: 256   # ignored
+flow_hidden_dim: 512    # ignored
+flow_num_layers: 4      # ignored
 
 # Flow-matching loss weights
 pos_loss_weight: 30.0

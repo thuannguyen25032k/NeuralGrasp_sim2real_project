@@ -4,14 +4,15 @@
 #       bash scripts/gen_demonstrations_all.sh
 #
 # System: Intel Core Ultra 9 285K (24 cores, no HT), 122 GB RAM, RTX 6000 Ada (48 GB VRAM)
-#   1 task = 2 generators x --processes=4 = 8 CoppeliaSim instances, ~24 GB RAM
-#   MAX_PARALLEL_TASKS=3 -> 24 cores, ~72 GB RAM
+#   1 task = 2 generators x --processes=6 = 12 CoppeliaSim instances, ~24 GB RAM
+#   MAX_PARALLEL_TASKS=2 -> 24 cores, ~48 GB RAM (safe), raise to 3 if RAM allows
 
 set -euo pipefail
 
-ALL_TASK="close_jar open_drawer sweep_to_dustpan_of_size meat_off_grill turn_tap slide_block_to_color_target put_item_in_drawer reach_and_drag push_buttons stack_blocks stack_cups put_groceries_in_cupboard insert_onto_square_peg place_wine_at_rack_location put_money_in_safe"
+# ALL_TASK="close_jar open_drawer sweep_to_dustpan_of_size meat_off_grill turn_tap slide_block_to_color_target put_item_in_drawer reach_and_drag stack_blocks"
+ALL_TASK="light_bulb_in put_money_in_safe place_wine_at_rack_location put_groceries_in_cupboard place_shape_in_shape_sorter push_buttons insert_onto_square_peg stack_cups place_cups"
 
-MAX_PARALLEL_TASKS=3
+MAX_PARALLEL_TASKS=2
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

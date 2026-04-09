@@ -1,5 +1,5 @@
 # example to run our ManiGaussian:
-#       bash scripts/train_and_eval_w_geo_sem_dyna.sh ManiGaussian_BC 0,1 12345 ${exp_name}
+#       bash scripts/train_and_eval_w_geo_sem_dyna.sh ManiGaussian_BC 0 12345 manigaussian_run1
 # this file does not support other examples.
 
 # set the method name
@@ -29,20 +29,20 @@ replay_dir="${cur_dir}/replay/${exp_name}"
 # override hyper-params in config.yaml
 #######
 batch_size=1
-tasks=[close_jar,open_drawer,sweep_to_dustpan_of_size,meat_off_grill,turn_tap,slide_block_to_color_target,put_item_in_drawer,reach_and_drag,push_buttons,stack_blocks]
+tasks=[light_bulb_in,put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,place_shape_in_shape_sorter,push_buttons,insert_onto_square_peg,stack_cups,place_cups]
 demo=20
 lambda_embed=0.01
 lambda_dyna=0.1
 lambda_reg=0.0
 render_freq=5000
 
-python_exec="/app/.venv/bin/python"
-if [ ! -x "${python_exec}" ]; then
-	python_exec="python"
-fi
+# python_exec="/app/.venv/bin/python"
+# if [ ! -x "${python_exec}" ]; then
+# 	python_exec="python"
+# fi
 
 train_cmd=(
-	"${python_exec}" train.py
+	"uv" "run" "train.py"
 	"method=${method}"
 	"rlbench.task_name=${exp_name}"
 	"rlbench.demo_path=${train_demo_path}"

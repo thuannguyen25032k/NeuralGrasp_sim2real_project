@@ -9,7 +9,7 @@ import time
 from typing import Optional, List
 from typing import Union
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import gc
 import numpy as np
 import psutil
@@ -27,7 +27,7 @@ from yarr.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from termcolor import cprint
 from tqdm import tqdm
 import wandb
-from lightning.fabric import Fabric
+from lightning_fabric import Fabric
 
 
 class OfflineTrainRunner():
@@ -36,6 +36,7 @@ class OfflineTrainRunner():
                  agent: Agent,
                  wrapped_replay_buffer: PyTorchReplayBuffer,
                  train_device: torch.device,
+                 zarr_loader=None,
                  stat_accumulator: Union[StatAccumulator, None] = None,
                  iterations: int = int(6e6),
                  logdir: str = '/tmp/yarr/logs',
@@ -53,6 +54,7 @@ class OfflineTrainRunner():
                  fabric: Fabric = None):
         self._agent = agent
         self._wrapped_buffer = wrapped_replay_buffer
+        self._zarr_loader = zarr_loader
         self._stat_accumulator = stat_accumulator
         self._iterations = iterations
         self._logdir = logdir
@@ -62,7 +64,6 @@ class OfflineTrainRunner():
         self._num_weights_to_keep = num_weights_to_keep
         self._save_freq = save_freq
 
-        self._wrapped_buffer = wrapped_replay_buffer
         self._train_device = train_device
         self._tensorboard_logging = tensorboard_logging
         self._csv_logging = csv_logging
@@ -76,12 +77,15 @@ class OfflineTrainRunner():
 
         if self.use_wandb and rank == 0:
             print(f"wandb init in {cfg.framework.wandb_project}/{cfg.framework.wandb_group}/{cfg.framework.seed}")
-            # wandb.init(project=cfg.framework.wandb_project, group=str(cfg.framework.wandb_group), name=str(cfg.framework.seed), 
-            #         config=cfg)
             wandb_name = str(cfg.framework.seed) if cfg.framework.wandb_name is None else cfg.framework.wandb_name
-            wandb.init(project=cfg.framework.wandb_project, group=str(cfg.framework.wandb_group), name=wandb_name, 
-                    config=cfg)
+            wandb.init(project=cfg.framework.wandb_project, group=str(cfg.framework.wandb_group), name=wandb_name,
+                    config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False))
             cprint(f'[wandb] init in {cfg.framework.wandb_project}/{cfg.framework.wandb_group}/{wandb_name}', 'cyan')
+            # Persist the run id into the seed dir so eval.py can resume into
+            # the same W&B run and metrics land on the same chart.
+            if logdir:
+                with open(os.path.join(logdir, 'wandb_run_id.txt'), 'w') as _f:
+                    _f.write(wandb.run.id)
 
     
         if weightsdir is None:
@@ -103,7 +107,8 @@ class OfflineTrainRunner():
 
     def _step(self, i, sampled_batch, **kwargs):
         update_dict = self._agent.update(i, sampled_batch, **kwargs)
-        total_losses = update_dict['total_losses'].item()
+        loss_tensor = update_dict.get('total_loss', update_dict.get('total_losses'))
+        total_losses = loss_tensor.item()
         return total_losses
 
     def _get_resume_eval_epoch(self):
@@ -171,16 +176,18 @@ class OfflineTrainRunner():
                 start_iter = 0
             else:
                 resume_iteration = existing_weights[-1]
-                if self._fabric is not None:
-                    self._agent.load_weights(os.path.join(self._weightsdir, str(resume_iteration)), fabric=self._fabric)
-                else:
-                    self._agent.load_weights(os.path.join(self._weightsdir, str(resume_iteration)))
+                self._agent.load_weights(os.path.join(self._weightsdir, str(resume_iteration)))
                 start_iter = resume_iteration + 1
                 if self._rank == 0:
                     logging.info(f"load weights from {os.path.join(self._weightsdir, str(resume_iteration))} ...")
                     logging.info(f"Resuming training from iteration {resume_iteration} ...")
 
-        dataset = self._wrapped_buffer.dataset()    # <class 'torch.utils.data.dataloader.DataLoader'>
+        # Use the fast Zarr DataLoader if provided, otherwise fall back to the
+        # YARR PyTorchReplayBuffer (used by all other methods).
+        if self._zarr_loader is not None:
+            dataset = self._zarr_loader
+        else:
+            dataset = self._wrapped_buffer.dataset()    # <class 'torch.utils.data.dataloader.DataLoader'>
 
         # DDP setup dataloader
         if self._fabric is not None:

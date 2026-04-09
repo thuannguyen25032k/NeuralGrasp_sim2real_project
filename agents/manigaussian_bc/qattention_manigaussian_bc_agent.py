@@ -25,7 +25,7 @@ from helpers.language_model import create_language_model
 
 import wandb
 import visdom
-from lightning.fabric import Fabric
+from lightning_fabric import Fabric
 
 
 NAME = 'QAttentionAgent'

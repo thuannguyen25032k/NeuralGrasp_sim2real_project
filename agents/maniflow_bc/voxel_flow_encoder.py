@@ -273,34 +273,35 @@ class TransformerHead(nn.Module):
         )[-1]   # (B, 1+N, emb)
 
         # ---- Position head ----------------------------------------------- #
-        # Pass the full joint feature sequence (action + scene tokens) so that
-        # position_self_attn can attend over scene context, exactly as the
-        # original base_denoise_actor.predict_pos does:
+        # Project FIRST, then attend: mirrors base_denoise_actor.predict_pos:
         #   position_features = self.position_self_attn(features, features, ...)
         #   position_features = position_features[:, :traj_len]  # slice action tokens
+        # The projection acts as an input gate before the dedicated self-attn block.
+        pos_feat = self.position_proj(joint_feats)   # (B, 1+N, emb)
         pos_feat = self.position_self_attn(
-            seq1=joint_feats,
-            seq2=joint_feats,
+            seq1=pos_feat,
+            seq2=pos_feat,
             seq1_pos=joint_pos,
             seq2_pos=joint_pos,
             ada_sgnl=time_embs,
         )[-1][:, :1, :]   # (B, 1+N, emb) -> slice action token -> (B, 1, emb)
-        pos_feat  = self.position_proj(pos_feat)
         position  = self.position_predictor(pos_feat).squeeze(1)   # (B, 3)
 
         # ---- Rotation head ----------------------------------------------- #
+        rot_feat  = self.rotation_proj(joint_feats)  # (B, 1+N, emb)
         rot_feat  = self.rotation_self_attn(
-            seq1=joint_feats,
-            seq2=joint_feats,
+            seq1=rot_feat,
+            seq2=rot_feat,
             seq1_pos=joint_pos,
             seq2_pos=joint_pos,
             ada_sgnl=time_embs,
         )[-1][:, :1, :]   # (B, 1+N, emb) -> slice action token -> (B, 1, emb)
-        rot_feat  = self.rotation_proj(rot_feat)
         rotation  = self.rotation_predictor(rot_feat).squeeze(1)   # (B, 4)
 
         # ---- Gripper head ------------------------------------------------ #
-        openess = self.openess_predictor(pos_feat).squeeze(1)       # (B, 1)
+        # Use the action token from joint_feats (not pos_feat which is
+        # already projected through the position head's linear layer).
+        openess = self.openess_predictor(joint_feats[:, :1, :]).squeeze(1)  # (B, 1)
 
         return torch.cat([position, rotation, openess], dim=-1)     # (B, 8)
 
@@ -481,8 +482,10 @@ class VoxelFlowEncoder(nn.Module):
         bb_max = self.coord_bounds[3:]
 
         lin = torch.linspace(0.5 / ds, 1.0 - 0.5 / ds, ds, device=device)
-        # indexing='ij' -> zz varies slowest, xx fastest (matches rearrange xyz)
-        zz, yy, xx = torch.meshgrid(lin, lin, lin, indexing='ij')
+        # indexing='ij': xx[i,j,k]=lin[i], yy[i,j,k]=lin[j], zz[i,j,k]=lin[k]
+        # rearrange 'b c x y z -> b (x y z) c' flattens so token n corresponds
+        # to voxel (x=n//ds^2, y=(n//ds)%ds, z=n%ds), matching lin[i,j,k] order.
+        xx, yy, zz = torch.meshgrid(lin, lin, lin, indexing='ij')
         grid = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)  # (N, 3)
         grid = grid * (bb_max - bb_min).to(device) + bb_min.to(device)
         return grid.unsqueeze(0).expand(B, -1, -1)   # (B, N, 3)
@@ -537,6 +540,14 @@ class VoxelFlowEncoder(nn.Module):
         lang_token_embs: torch.Tensor,   # (B, 77, lang_emb_dim)
     ):
         """
+        This function encodes the raw inputs into the voxel and language features needed for the Gaussian Splatting renderer and the Transformer action head.
+        
+        Args:
+        voxel_grid       : (B, C_init, V, V, V)  raw voxel grid input
+        proprio          : (B, low_dim_size)     raw proprio vector (e.g. gripper state)
+        lang_goal_emb    : (B, lang_feat_dim)   sentence-level language embedding (e.g. CLIP text encoder output)
+        lang_token_embs  : (B, 77, lang_emb_dim) token-level language embeddings (e.g. CLIP token embeddings)
+        
         Returns
         -------
         voxel_grid_feature : (B, im_channels, V, V, V)  — for GS renderer
@@ -649,6 +660,18 @@ class VoxelFlowEncoder(nn.Module):
         mask=None,
     ):
         """
+        Agruments
+        ---------
+        voxel_grid       : (B, C_init, V, V, V)  raw voxel grid input
+        proprio          : (B, low_dim_size)     raw proprio vector (e.g. gripper open/close state)
+        lang_goal_emb    : (B, lang_feat_dim)     sentence-level language embedding (e.g. CLIP)
+        lang_token_embs   : (B, seq, lang_emb_dim)  token-level language embeddings (e.g. CLIP tokens)
+
+        prev_layer_voxel_grid: (B, C_prev, V, V, V)  from previous layer (ignored)
+        bounds: None (ignored)
+        prev_layer_bounds: None (ignored)
+        mask: None (ignored)
+        
         Returns
         -------
         voxel_grid_feature : (B, im_channels, V, V, V)

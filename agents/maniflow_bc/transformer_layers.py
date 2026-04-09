@@ -79,9 +79,10 @@ class FFWLayer(DummyLayer):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x, ada_sgnl=None):
+        residual = x
         x = self._norm(x, self.norm, self.pre_norm)
-        x = self._adaln(x, self.adaln, ada_sgnl)
-        x = x + self.ffn(x)
+        x_modulated = self._adaln(x, self.adaln, ada_sgnl)
+        x = residual + self.ffn(x_modulated)
         x = self._norm(x, self.norm, not self.pre_norm)
         return x
 

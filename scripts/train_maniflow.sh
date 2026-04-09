@@ -5,7 +5,7 @@
 #   bash scripts/train_maniflow.sh [GPU_IDS] [PORT] [EXP_NAME]
 #
 # Examples:
-#   bash scripts/train_maniflow.sh 0,1 12345 maniflow_run1
+#   bash scripts/train_maniflow.sh 0 12345 maniflow_run1
 #   bash scripts/train_maniflow.sh 0   12345
 
 method="ManiFlow_BC"
@@ -31,7 +31,7 @@ echo "Log file: ${log_file}"
 
 # ---- Hyperparameters -------------------------------------------------------
 batch_size=1
-tasks=[close_jar,open_drawer,sweep_to_dustpan_of_size,meat_off_grill,turn_tap,slide_block_to_color_target,put_item_in_drawer,reach_and_drag,push_buttons,stack_blocks]
+tasks=[light_bulb_in,put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,place_shape_in_shape_sorter,push_buttons,insert_onto_square_peg,stack_cups,place_cups]
 demo=20
 lambda_dyna=0.1
 lambda_reg=0.0
@@ -44,13 +44,13 @@ flow_hidden_dim=512
 flow_num_layers=4
 # ----------------------------------------------------------------------------
 
-python_exec="/app/.venv/bin/python"
-if [ ! -x "${python_exec}" ]; then
-    python_exec="python"
-fi
+# python_exec="/app/.venv/bin/python"
+# if [ ! -x "${python_exec}" ]; then
+# 	python_exec="python"
+# fi
 
 train_cmd=(
-    "${python_exec}" train.py
+	"uv" "run" "train.py"
     "method=${method}"
     "rlbench.task_name=${exp_name}"
     "rlbench.demo_path=${train_demo_path}"

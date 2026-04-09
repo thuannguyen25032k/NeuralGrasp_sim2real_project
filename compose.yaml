@@ -21,7 +21,10 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - .:/app/
-      - neuralgrasp_venv:/app/.venv
+      # Protect the image-built venv from being overwritten by the .:/app/ bind mount.
+      # This anonymous volume shadows /app/.venv so the container always uses
+      # the venv that was compiled into the image (with the correct torch+CUDA versions).
+      - /app/.venv
 
     ports:
       - "2403:6001"
@@ -45,5 +48,3 @@ services:
     # Default startup command (interactive shell)
     command: /bin/bash
 
-volumes:
-  neuralgrasp_venv:

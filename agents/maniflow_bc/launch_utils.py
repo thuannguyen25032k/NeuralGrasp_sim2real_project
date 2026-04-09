@@ -11,7 +11,8 @@ Mirrors agents/manigaussian_bc/launch_utils.py but:
 """
 
 import logging
-from typing import List
+import random
+from typing import List, Optional
 
 import numpy as np
 from rlbench.backend.observation import Observation
@@ -33,13 +34,18 @@ from helpers.language_model import create_language_model
 from agents.maniflow_bc.voxel_flow_encoder import VoxelFlowEncoder
 from agents.maniflow_bc.qattention_maniflow_agent import ManiFlowBCAgent
 from agents.maniflow_bc.qattention_stack_agent import ManiFlowStackAgent
+# --- Fast Zarr DataLoader (Recommendation 1 + 2 + 3) ---
+from agents.maniflow_bc.zarr_dataset import ManiFlowZarrDataset, maniflow_collate_fn
+from agents.maniflow_bc.gpu_preprocessor import ManiFlowGPUPreprocessor
 
 import torch
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import multiprocessing as mp
 from torch.multiprocessing import Process, Value, Manager
 from omegaconf import DictConfig
 from termcolor import colored, cprint
-from lightning.fabric import Fabric
+from lightning_fabric import Fabric
 
 
 REWARD_SCALE = 100.0
@@ -66,43 +72,74 @@ def create_replay(batch_size: int, timesteps: int,
         image_size = [128, 128]
 
     gripper_pose_size = 7
+    ignore_collisions_size = 1
     max_token_seq_len = 77
-    lang_feat_dim              = 1024
-    lang_emb_dim               = cfg.method.language_model_dim
+    lang_feat_dim = 1024
+    lang_emb_dim = cfg.method.language_model_dim
     cprint(f"[create_replay] lang_emb_dim: {lang_emb_dim}", "green")
 
     num_view_for_nerf = cfg.rlbench.num_view_for_nerf
 
     observation_elements = []
     observation_elements.append(
-        ObservationElement('low_dim_state', (LOW_DIM_SIZE,), np.float32))
+        ObservationElement('low_dim_state', (LOW_DIM_SIZE,), np.float32))  # low-dim state (e.g. gripper xyz, open/close) for auxiliary losses and non-visual baselines
 
     for cname in cameras:
         observation_elements.extend([
-            ObservationElement('%s_rgb' % cname,          (3, *image_size,), np.float32),
-            ObservationElement('%s_depth' % cname,        (1, *image_size,), np.float32),
-            ObservationElement('%s_point_cloud' % cname,  (3, *image_size),  np.float32),
-            ObservationElement('%s_camera_extrinsics' % cname, (4, 4,), np.float32),
-            ObservationElement('%s_camera_intrinsics' % cname, (3, 3,), np.float32),
+            # RGB image (normalized to [0, 1]) has shape (3, H, W) to be compatible with PyTorch ConvNets
+            ObservationElement('%s_rgb' % cname,
+                               (3, *image_size,), np.float32),
+            # depth image has shape (1, H, W) to be compatible with PyTorch ConvNets
+            ObservationElement('%s_depth' % cname,
+                               (1, *image_size,), np.float32),
+            # point cloud has shape (3, H, W) to be compatible with PyTorch ConvNets
+            ObservationElement('%s_point_cloud' %
+                               cname,  (3, *image_size),  np.float32),
+            # camera extrinsics has shape (4, 4) to be compatible with PyTorch ConvNets
+            ObservationElement('%s_camera_extrinsics' %
+                               cname, (4, 4,), np.float32),
+            # camera intrinsics has shape (3, 3) to be compatible with PyTorch ConvNets
+            ObservationElement('%s_camera_intrinsics' %
+                               cname, (3, 3,), np.float32),
         ])
 
     # NeRF multi-view observations (same as manigaussian_bc)
     for prefix in ('nerf_multi_view', 'nerf_next_multi_view'):
         observation_elements.extend([
-            ObservationElement(f'{prefix}_rgb',    (num_view_for_nerf,), np.object_),
-            ObservationElement(f'{prefix}_depth',  (num_view_for_nerf,), np.object_),
-            ObservationElement(f'{prefix}_camera', (num_view_for_nerf,), np.object_),
+            # (num_views,) array of (3, H, W) RGB images stored as objects since they can be large and variable-length
+            ObservationElement(f'{prefix}_rgb',
+                               (num_view_for_nerf,), np.object_),
+            # (num_views,) array of (1, H, W) depth images stored as objects since they can be large and variable-length
+            ObservationElement(f'{prefix}_depth',
+                               (num_view_for_nerf,), np.object_),
+            # (num_views,) array of dicts with 'extrinsics' (4, 4) and 'intrinsics' (3, 3) stored as objects since they can be large and variable-length
+            ObservationElement(f'{prefix}_camera',
+                               (num_view_for_nerf,), np.object_),
         ])
-
+    # ---------------------------------------------------------------------------
+    # Additional observation elements specific to ManiFlow (not in manigaussian_bc):
+    #  - gripper pose (for flow regression target)
+    #  - ignore collisions flag (for flow regression loss masking)
+    #  - language goal embedding + token embeddings (for language-conditioned modeling)
+    #  - task name (for task-uniform sampling and analysis)
+    #  - language goal (for analysis; stored as object since it can be variable-length string)
+    # ---------------------------------------------------------------------------
     observation_elements.extend([
-        ReplayElement('gripper_pose',        (gripper_pose_size,),               np.float32),
-        ReplayElement('ignore_collisions',   (1,),                               np.float32),
-        ReplayElement('lang_goal_emb',       (lang_feat_dim,),                   np.float32),
-        ReplayElement('lang_token_embs',     (max_token_seq_len, lang_emb_dim,), np.float32),
-        ReplayElement('task',  (), str),
+        # gripper pose has shape (7,) to be compatible with PyTorch ConvNets
+        ReplayElement('gripper_pose',
+                      (gripper_pose_size,),               np.float32),
+        # language goal embedding has shape (1024,) to be compatible with PyTorch ConvNets
+        ReplayElement('lang_goal_emb',       (lang_feat_dim,
+                                              ),                   np.float32),
+        # language token embeddings has shape (77, 1024) to be compatible with PyTorch ConvNets
+        ReplayElement('lang_token_embs',
+                      (max_token_seq_len, lang_emb_dim,), np.float32),
+        ReplayElement('task',  (), str),   # task is a string
+        # language goal is an object (stored as object since it can be variable-length string)
         ReplayElement('lang_goal', (1,), object),
     ])
 
+    # flag to indicate whether this transition is from a demo (vs. generated by the agent's own policy) for analysis purposes; stored as bool
     extra_replay_elements = [ReplayElement('demo', (), np.bool_)]
 
     if not single_process:
@@ -157,7 +194,7 @@ def _get_action(obs_tp1: Observation):
         quat,                       # normalized + canonical quat (qw >= 0)
         np.array([grip])
     ])
-    return continuous_action
+    return continuous_action    
 
 
 def _add_keypoints_to_replay(
@@ -173,16 +210,17 @@ def _add_keypoints_to_replay(
         device='cpu'):
 
     prev_action = None
-    obs = inital_obs
+    obs = inital_obs    # Initial observation is 0
 
-    for k, keypoint in enumerate(episode_keypoints):
-        obs_tp1 = demo[keypoint]
-        obs_tm1 = demo[max(0, keypoint - 1)]
+    for k, keypoint in enumerate(episode_keypoints):    # demo[-1].nerf_multi_view_rgb is none 
+        obs_tp1 = demo[keypoint]    # target obs is at the keypoint
+        obs_tm1 = demo[max(0, keypoint - 1)]  # obs_tm1 is used for extracting the previous action and ignore_collisions flag; if keypoint is 0, we use the initial observation (demo[0]) for these fields since there is no previous step
 
-        action = _get_action(obs_tp1)
+        action = _get_action(obs_tp1)   # action is the continuous 8-DoF gripper pose at the target step (obs_tp1)
+        ignore_collisions = int(obs_tm1.ignore_collisions)  # ignore_collisions flag is taken from obs_tm1 since it indicates whether the transition to obs_tp1 involved a collision, and we want to mask out the flow regression loss for this transition if there was a collision
 
         terminal = (k == len(episode_keypoints) - 1)
-        reward   = float(terminal) * REWARD_SCALE if terminal else 0
+        reward = float(terminal) * REWARD_SCALE if terminal else 0
 
         obs_dict = utils.extract_obs(
             obs, t=k, prev_action=prev_action,
@@ -191,21 +229,23 @@ def _add_keypoints_to_replay(
             next_obs=obs_tp1 if not terminal else obs_tm1,
         )
         sentence_emb, token_embs = language_model.extract(description)
-        obs_dict['lang_goal_emb']   = sentence_emb[0].float().detach().cpu().numpy()
-        obs_dict['lang_token_embs'] = token_embs[0].float().detach().cpu().numpy()
-        obs_dict['lang_goal']       = np.array([description], dtype=object)
+        obs_dict['lang_goal_emb'] = sentence_emb[0].float(
+        ).detach().cpu().numpy()
+        obs_dict['lang_token_embs'] = token_embs[0].float(
+        ).detach().cpu().numpy()
+        obs_dict['lang_goal'] = np.array([description], dtype=object)
 
         prev_action = np.copy(action)
 
         others = {'demo': True}
         final_obs = {
             'gripper_pose':      obs_tp1.gripper_pose,
-            'ignore_collisions': np.array([int(obs_tp1.ignore_collisions)], dtype=np.float32),
             'task':              task,
             'lang_goal':         np.array([description], dtype=object),
         }
         others.update(obs_dict)   # current-step observation (obs, not obs_tp1)
-        others.update(final_obs)  # target-step fields overwrite any obs_dict clashes
+        # target-step fields overwrite any obs_dict clashes
+        others.update(final_obs)
 
         timeout = False
         replay.add(action, reward, terminal, timeout, **others)
@@ -218,9 +258,11 @@ def _add_keypoints_to_replay(
         episode_length=cfg.rlbench.episode_length,
         next_obs=obs_tp1,
     )
-    obs_dict_tp1['lang_goal_emb']   = sentence_emb[0].float().detach().cpu().numpy()
-    obs_dict_tp1['lang_token_embs'] = token_embs[0].float().detach().cpu().numpy()
-    obs_dict_tp1['lang_goal']       = np.array([description], dtype=object)
+    obs_dict_tp1['lang_goal_emb'] = sentence_emb[0].float(
+    ).detach().cpu().numpy()
+    obs_dict_tp1['lang_token_embs'] = token_embs[0].float(
+    ).detach().cpu().numpy()
+    obs_dict_tp1['lang_goal'] = np.array([description], dtype=object)
     obs_dict_tp1.pop('wrist_world_to_cam', None)
     obs_dict_tp1.update(final_obs)
     replay.add_final(**obs_dict_tp1)
@@ -303,21 +345,21 @@ def fill_multi_task_replay(cfg: DictConfig,
                            fabric: Fabric = None):
 
     manager = Manager()
-    store   = manager.dict()
+    store = manager.dict()
 
     if hasattr(replay, '_task_idxs'):
         del replay._task_idxs
-    task_idxs         = manager.dict()
+    task_idxs = manager.dict()
     replay._task_idxs = task_idxs
     replay._create_storage(store)
     replay.add_count = Value('i', 0)
 
     max_parallel_processes = cfg.replay.max_parallel_processes
     processes = []
-    n       = np.arange(len(tasks))
+    n = np.arange(len(tasks))
     split_n = utils.split_list(n, max_parallel_processes)
 
-    device         = fabric.device if fabric is not None else None
+    device = fabric.device if fabric is not None else None
     language_model = create_language_model(
         name=cfg.method.language_model, device=device
     )
@@ -344,6 +386,126 @@ def fill_multi_task_replay(cfg: DictConfig,
 
 
 # ---------------------------------------------------------------------------
+# Fast Zarr-based DataLoader (Recommendation 1 + 3)
+# ---------------------------------------------------------------------------
+
+def create_zarr_loader(
+        zarr_path: str,
+        batch_size: int,
+        cameras: List[str] = None,
+        num_workers: int = 4,
+        mem_gb: float = 8.0,
+        relative_action: bool = False,
+        copies: int = 10,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+) -> tuple:
+    """
+    Build a DataLoader backed by ``ManiFlowZarrDataset``.
+
+    Applies all three DataLoader optimisations from 3d_flowmatch_actor:
+      - ``prefetch_factor=4``    → keep 4 batches pre-loaded in worker RAM
+      - ``persistent_workers``   → workers stay alive across epochs (no fork overhead)
+      - ``pin_memory=True``      → faster H→D transfer for CUDA tensors
+      - Seeded ``worker_init_fn``→ reproducible augmentation per worker
+      - ``DistributedSampler``   → proper data sharding in DDP runs
+
+    Parameters
+    ----------
+    zarr_path        : str        Path to ``{split}.zarr``.
+    batch_size       : int        Batch size per GPU.
+    cameras          : list[str]  Camera names (must match converter order).
+    num_workers      : int        DataLoader worker processes (default 4).
+    mem_gb           : float      LRU cache per worker process in GiB.
+    relative_action  : bool       Return delta actions (SO(3) relative).
+    copies           : int        Virtual dataset multiplier.
+    distributed      : bool       Use DistributedSampler (for DDP).
+    rank / world_size: int        DDP rank / world-size.
+    seed             : int        Global RNG seed for reproducibility.
+
+    Returns
+    -------
+    (loader, dataset, sampler)
+    """
+    dataset = ManiFlowZarrDataset(
+        zarr_path=zarr_path,
+        cameras=cameras or ["front"],
+        mem_gb=mem_gb,
+        relative_action=relative_action,
+        copies=copies,
+    )
+
+    def _seed_worker(worker_id: int):
+        """Seed numpy + random in each DataLoader worker for reproducibility."""
+        worker_seed = torch.initial_seed() % 2 ** 32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    if distributed:
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True
+        )
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle if sampler is None else False,
+        num_workers=num_workers,
+        worker_init_fn=_seed_worker,
+        collate_fn=maniflow_collate_fn,
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=True,
+        generator=g,
+        prefetch_factor=4 if num_workers > 0 else None,   # Recommendation 3
+        persistent_workers=num_workers > 0,               # Recommendation 3
+    )
+    return loader, dataset, sampler
+
+
+# ---------------------------------------------------------------------------
+# GPU Pre-processor factory (Recommendation 2)
+# ---------------------------------------------------------------------------
+
+def create_gpu_preprocessor(
+        image_size: tuple = (128, 128),
+        augment_prob: float = 0.8,
+        crop_prob: float = 0.1,
+        custom_imsize: Optional[int] = None,
+) -> ManiFlowGPUPreprocessor:
+    """
+    Instantiate a ``ManiFlowGPUPreprocessor`` (GPU-side depth→PCD + kornia
+    augmentation).
+
+    The returned module should be moved to the training device:
+        preprocessor = create_gpu_preprocessor(...).to(device)
+
+    During training call:
+        rgb_proc, pcd_proc = preprocessor(rgb, depth, extrinsics, intrinsics,
+                                          augment=True)
+    During evaluation:
+        rgb_proc, pcd_proc = preprocessor(rgb, depth, extrinsics, intrinsics,
+                                          augment=False)
+    """
+    return ManiFlowGPUPreprocessor(
+        image_size=image_size,
+        augment_prob=augment_prob,
+        crop_prob=crop_prob,
+        custom_imsize=custom_imsize,
+    )
+
+
+# ---------------------------------------------------------------------------
 # create_agent
 # ---------------------------------------------------------------------------
 
@@ -363,87 +525,87 @@ def create_agent(cfg: DictConfig) -> PreprocessAgent:
       # legacy MLP stubs (kept for YAML back-compat, not used functionally):
       flow_context_dim, flow_hidden_dim, flow_num_layers
     """
-    depth_0bounds  = cfg.rlbench.scene_bounds
+    depth_0bounds = cfg.rlbench.scene_bounds
     cam_resolution = cfg.rlbench.camera_resolution
 
     # Transformer head hyperparameters (read from cfg, fall back to defaults)
-    embedding_dim          = getattr(cfg.method, 'embedding_dim',          120)
-    num_attn_heads         = getattr(cfg.method, 'num_attn_heads',         8)
+    embedding_dim = getattr(cfg.method, 'embedding_dim',          120)
+    num_attn_heads = getattr(cfg.method, 'num_attn_heads',         8)
     num_shared_attn_layers = getattr(cfg.method, 'num_shared_attn_layers', 4)
     voxel_token_downsample = getattr(cfg.method, 'voxel_token_downsample', 5)
-    num_fps_tokens         = getattr(cfg.method, 'num_fps_tokens',         512)
-    denoise_timesteps      = getattr(cfg.method, 'denoise_timesteps',      100)
-    action_dim             = getattr(cfg.method, 'action_dim',             8)
+    num_fps_tokens = getattr(cfg.method, 'num_fps_tokens',         512)
+    denoise_timesteps = getattr(cfg.method, 'denoise_timesteps',      100)
+    action_dim = getattr(cfg.method, 'action_dim',             8)
     # Legacy stubs (ignored by new VoxelFlowEncoder but kept for YAML compat)
-    flow_context_dim  = getattr(cfg.method, 'flow_context_dim',  256)
-    flow_hidden_dim   = getattr(cfg.method, 'flow_hidden_dim',   512)
-    flow_num_layers   = getattr(cfg.method, 'flow_num_layers',   4)
+    flow_context_dim = getattr(cfg.method, 'flow_context_dim',  256)
+    flow_hidden_dim = getattr(cfg.method, 'flow_hidden_dim',   512)
+    flow_num_layers = getattr(cfg.method, 'flow_num_layers',   4)
 
     qattention_agents = []
     for depth, vox_size in enumerate(cfg.method.voxel_sizes):
 
         flow_encoder = VoxelFlowEncoder(
-            voxel_size             = vox_size,
-            initial_dim            = 3 + 3 + 1 + 3,   # rgb + xyz + density + normal
-            low_dim_size           = 4,
-            im_channels            = cfg.method.final_dim,
-            lang_feat_dim          = 1024,             # CLIP sentence embedding
-            lang_emb_dim           = cfg.method.language_model_dim,
-            action_dim             = action_dim,
-            embedding_dim          = embedding_dim,
-            num_attn_heads         = num_attn_heads,
-            num_shared_attn_layers = num_shared_attn_layers,
-            voxel_token_downsample = voxel_token_downsample,
-            num_fps_tokens         = num_fps_tokens,
-            coordinate_bounds      = list(depth_0bounds),
-            denoise_timesteps      = denoise_timesteps,
-            activation             = cfg.method.activation,
-            lang_fusion_type       = cfg.method.lang_fusion_type,
+            voxel_size=vox_size,
+            initial_dim=3 + 3 + 1 + 3,   # rgb + xyz + density + normal
+            low_dim_size=4,
+            im_channels=cfg.method.final_dim,
+            lang_feat_dim=1024,             # CLIP sentence embedding
+            lang_emb_dim=cfg.method.language_model_dim,
+            action_dim=action_dim,
+            embedding_dim=embedding_dim,
+            num_attn_heads=num_attn_heads,
+            num_shared_attn_layers=num_shared_attn_layers,
+            voxel_token_downsample=voxel_token_downsample,
+            num_fps_tokens=num_fps_tokens,
+            coordinate_bounds=list(depth_0bounds),
+            denoise_timesteps=denoise_timesteps,
+            activation=cfg.method.activation,
+            lang_fusion_type=cfg.method.lang_fusion_type,
             # legacy stubs
-            context_dim            = flow_context_dim,
-            flow_hidden_dim        = flow_hidden_dim,
-            flow_num_layers        = flow_num_layers,
-            voxel_patch_size       = cfg.method.voxel_patch_size,
-            voxel_patch_stride     = cfg.method.voxel_patch_stride,
-            cfg                    = cfg,
+            context_dim=flow_context_dim,
+            flow_hidden_dim=flow_hidden_dim,
+            flow_num_layers=flow_num_layers,
+            voxel_patch_size=cfg.method.voxel_patch_size,
+            voxel_patch_stride=cfg.method.voxel_patch_stride,
+            cfg=cfg,
         )
 
         qattention_agent = ManiFlowBCAgent(
-            layer                  = depth,
-            coordinate_bounds      = depth_0bounds,
-            flow_encoder           = flow_encoder,
-            camera_names           = cfg.rlbench.cameras,
-            voxel_size             = vox_size,
-            bounds_offset          = cfg.method.bounds_offset[depth - 1] if depth > 0 else None,
-            image_crop_size        = cfg.method.image_crop_size,
-            lr                     = cfg.method.lr,
-            training_iterations    = cfg.framework.training_iterations,
-            lr_scheduler           = cfg.method.lr_scheduler,
-            num_warmup_steps       = cfg.method.num_warmup_steps,
-            include_low_dim_state  = True,
-            image_resolution       = cam_resolution,
-            batch_size             = cfg.replay.batch_size,
-            voxel_feature_size     = 3,
-            lambda_weight_l2       = cfg.method.lambda_weight_l2,
-            transform_augmentation = cfg.method.transform_augmentation.apply_se3,
-            transform_augmentation_xyz = cfg.method.transform_augmentation.aug_xyz,
-            transform_augmentation_rpy = cfg.method.transform_augmentation.aug_rpy,
-            transform_augmentation_rot_resolution =
-                cfg.method.transform_augmentation.aug_rot_resolution,
-            optimizer_type         = cfg.method.optimizer,
-            num_devices            = cfg.ddp.num_devices,
-            denoise_timesteps      = denoise_timesteps,
-            action_dim             = action_dim,
-            pos_loss_weight        = getattr(cfg.method, 'pos_loss_weight',  30.0),
-            rot_loss_weight        = getattr(cfg.method, 'rot_loss_weight',  10.0),
-            grip_loss_weight       = getattr(cfg.method, 'grip_loss_weight',  1.0),
-            cfg                    = cfg.method,
+            layer=depth,
+            coordinate_bounds=depth_0bounds,
+            flow_encoder=flow_encoder,
+            camera_names=cfg.rlbench.cameras,
+            voxel_size=vox_size,
+            bounds_offset=cfg.method.bounds_offset[depth -
+                                                   1] if depth > 0 else None,
+            image_crop_size=cfg.method.image_crop_size,
+            lr=cfg.method.lr,
+            training_iterations=cfg.framework.training_iterations,
+            lr_scheduler=cfg.method.lr_scheduler,
+            num_warmup_steps=cfg.method.num_warmup_steps,
+            include_low_dim_state=True,
+            image_resolution=cam_resolution,
+            batch_size=cfg.replay.batch_size,
+            voxel_feature_size=3,
+            lambda_weight_l2=cfg.method.lambda_weight_l2,
+            transform_augmentation=cfg.method.transform_augmentation.apply_se3,
+            transform_augmentation_xyz=cfg.method.transform_augmentation.aug_xyz,
+            transform_augmentation_rpy=cfg.method.transform_augmentation.aug_rpy,
+            transform_augmentation_rot_resolution=cfg.method.transform_augmentation.aug_rot_resolution,
+            optimizer_type=cfg.method.optimizer,
+            num_devices=cfg.ddp.num_devices,
+            denoise_timesteps=denoise_timesteps,
+            action_dim=action_dim,
+            pos_loss_weight=getattr(cfg.method, 'pos_loss_weight',  30.0),
+            rot_loss_weight=getattr(cfg.method, 'rot_loss_weight',  10.0),
+            grip_loss_weight=getattr(cfg.method, 'grip_loss_weight',  1.0),
+            cfg=cfg.method,
         )
         qattention_agents.append(qattention_agent)
 
     flow_stack_agent = ManiFlowStackAgent(
-        qattention_agents = qattention_agents,
-        camera_names      = cfg.rlbench.cameras,
+        qattention_agents=qattention_agents,
+        camera_names=cfg.rlbench.cameras,
     )
     preprocess_agent = PreprocessAgent(pose_agent=flow_stack_agent)
     return preprocess_agent

@@ -27,7 +27,7 @@ class ManiFlowStackAgent(Agent):
 
     def build(self, training: bool, device=None,
               use_ddp: bool = True, **kwargs) -> None:
-        self._device = device or torch.device('cpu')
+        self._device = device if device is not None else torch.device('cpu')
         for qa in self._qattention_agents:
             qa.build(training, self._device, use_ddp, **kwargs)
 

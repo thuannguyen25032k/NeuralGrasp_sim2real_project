@@ -1,17 +1,21 @@
+# NOTE: the method is determined solely by the saved train config.yaml found in
+# logs/<task_name>/seed<N>/config.yaml — this key is NOT read by eval.py.
+# It is kept here only so Hydra does not complain when method.name is passed
+# as a CLI override (e.g. from eval.sh).
 method:
-    name: "ManiGaussian_BC"
+    name: "ManiFlow_BC"
 
 rlbench:
     task_name: "multi"
     # change the task as you want. in our paper, we select these 10 tasks.
     tasks: [close_jar,open_drawer,sweep_to_dustpan_of_size,meat_off_grill,turn_tap,slide_block_to_color_target,put_item_in_drawer,reach_and_drag,push_buttons,stack_blocks]
     demo_path: /my/demo/path
-    episode_length: 25
+    episode_length: 25   # must match training config (conf/config.yaml rlbench.episode_length)
     cameras: [front]
     camera_resolution: [128, 128]
     scene_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
     include_lang_goal_in_obs: True
-    time_in_state: True # default
+    time_in_state: True  # must match training; used directly by eval.py env_config
     headless: True  # default
 
 framework:
@@ -39,14 +43,27 @@ framework:
 
 cinematic_recorder:
     # enable cinematic recording during evaluation, so you could see the videos of the trajectory.
-    enabled: False 
+    enabled: True
     # enabled: True   # one video clip is 1MB
 
     camera_resolution: [1280, 720]
     fps: 30
     rotate_speed: 0.01
     # rotate_speed: 0 # NOTE: this is not front view
-    save_path: 'eval/videos/'   # non-sense
+    save_path: ${framework.logdir}/${rlbench.task_name}/videos/
+
+# ---------------------------------------------------------------------------
+# Replay / loader settings (ManiFlow_BC only).
+# Eval never constructs a DataLoader, but these values are forwarded to
+# eval_seed() so they can be read from eval_cfg when train_cfg is unavailable
+# (e.g. ablation scripts).  Keep in sync with conf/config.yaml.
+# ---------------------------------------------------------------------------
+replay:
+    use_zarr_loader: False          # not used at eval time; present for config parity
+    zarr_path: 'data/train_zarr/train.zarr'
+    zarr_num_workers: 4
+    zarr_mem_gb: 8.0
+    zarr_copies: 10
 
 hydra:
     run:

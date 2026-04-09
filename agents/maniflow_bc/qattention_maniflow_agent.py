@@ -29,7 +29,8 @@ import io
 
 from helpers.utils import visualise_voxel
 from voxel.voxel_grid import VoxelGrid
-from voxel.augmentation import apply_se3_augmentation_with_camera_pose
+from voxel.augmentation import (apply_se3_augmentation_with_camera_pose,
+                                 apply_se3_augmentation_continuous)
 from helpers.clip.core.clip import build_model, load_clip
 import PIL.Image as Image
 import transformers
@@ -43,7 +44,7 @@ from agents.maniflow_bc.voxel_flow_encoder import VoxelFlowEncoder
 from agents.maniflow_bc.rf_scheduler import RFScheduler
 
 import wandb
-from lightning.fabric import Fabric
+from lightning_fabric import Fabric
 
 NAME = 'ManiFlowAgent'
 
@@ -59,6 +60,13 @@ def _PSNR_torch(img1, img2, max_val=1):
 
 
 def _parse_camera_file(file_path):
+    """
+    Parses camera extrinsics and intrinsics from a text file.
+    Expected format: 
+    - Lines 0-3: 4x4 extrinsic matrix (row-major)
+    - Line 4: empty or comment
+    - Lines 5-7: 3x3 intrinsic matrix (row-major)
+    """
     with open(file_path, 'r') as f:
         lines = f.readlines()
     ext = []
@@ -74,11 +82,16 @@ def _parse_camera_file(file_path):
 
 
 def _parse_img_file(file_path, mask_gt_rgb=False):
+    """
+    Parses an RGB image from a file path and normalizes it to [0, 1].
+    """
     img = Image.open(file_path).convert('RGB')
     return np.asarray(img).astype(np.float32) / 255.0
 
 
 def _parse_depth_file(file_path):
+    """ Parses a depth image from a file path and converts it to a float32 numpy array.
+    The depth image is expected to be in a single-channel format (e.g., 16-bit PNG),"""
     d = Image.open(file_path).convert('L')
     return np.asarray(d).astype(np.float32)
 
@@ -133,13 +146,35 @@ class QFunctionFlow(nn.Module):
                      lang_goal_emb, lang_token_embs,
                      bounds=None, prev_bounds=None,
                      prev_layer_voxel_grid=None):
+        """
+        Encodes the input scene into a voxel grid and extracts features using the flow encoder.
+        Args:
+            rgb_pcd: list of tuples (rgb, pcd) for each camera view
+            depth: list of depth maps for each camera view
+            proprio: proprioceptive state
+            pcd: list of point clouds for each camera view
+            camera_extrinsics: list of extrinsic matrices for each camera view
+            camera_intrinsics: list of intrinsic matrices for each camera view
+            lang_goal_emb: language goal embedding
+            lang_token_embs: language token embeddings
+            bounds: optional pre-computed bounds for voxelization
+            prev_bounds: optional bounds from previous layer (for multi-layer setups)
+            prev_layer_voxel_grid: optional voxel grid from previous layer (for multi-layer setups)
+        Returns:
+            voxel_grid: (B, C, D, H, W) voxel grid of the scene
+            voxel_feat: (B, F) features extracted from the voxel grid by the flow encoder
+            lang_embedd: (B, L) language embedding output by the flow encoder
+            context: additional context output by the flow encoder (e.g., for velocity prediction)
+            bounds: (B, 6) bounds used for voxelization
+        """
 
         b = rgb_pcd[0][0].shape[0]
         pcd_flat = torch.cat(
             [p.permute(0, 2, 3, 1).reshape(b, -1, 3) for p in pcd], 1
-        )
+        )   # (B, N_points, 3)
+        # Flatten RGB features in the same order as the flattened point cloud
         rgb = [rp[0] for rp in rgb_pcd]
-        feat_size = rgb[0].shape[1]
+        feat_size = rgb[0].shape[1] # C from (B, C, H, W) = 3 for RGB
         flat_feats = torch.cat(
             [p.permute(0, 2, 3, 1).reshape(b, -1, feat_size) for p in rgb], 1
         )
@@ -148,8 +183,9 @@ class QFunctionFlow(nn.Module):
             pcd_flat, coord_features=flat_feats,
             coord_bounds=bounds, return_density=True
         )
-        voxel_grid = voxel_grid.permute(0, 4, 1, 2, 3).detach()
+        voxel_grid = voxel_grid.permute(0, 4, 1, 2, 3).detach() # (B, C, D, H, W) = (B, 10, 100, 100, 100)
 
+        # Pad bounds if necessary to ensure consistent shape for flow encoder
         if bounds.shape[0] != b:
             bounds = bounds.repeat(b, 1)
 
@@ -167,8 +203,6 @@ class QFunctionFlow(nn.Module):
                 lang_goal_emb, lang_token_embs,
                 bounds=None, prev_bounds=None,
                 prev_layer_voxel_grid=None,
-                # flow-matching args
-                noisy_action=None, timestep=None,
                 # neural rendering args
                 use_neural_rendering=False,
                 nerf_target_rgb=None, nerf_target_depth=None,
@@ -178,6 +212,43 @@ class QFunctionFlow(nn.Module):
                 nerf_next_target_depth=None,
                 nerf_next_target_camera_intrinsic=None,
                 gt_embed=None, step=None, action=None):
+        """
+        Full forward pass that encodes the scene, predicts velocity (if noisy_action and timestep are provided),
+        and computes the neural rendering loss (if use_neural_rendering is True).
+        
+        Args:
+            rgb_pcd: list of tuples (rgb, pcd) for each camera view
+            depth: list of depth maps for each camera view
+            proprio: proprioceptive state
+            pcd: list of point clouds for each camera view
+            camera_extrinsics: list of extrinsic matrices for each camera view
+            camera_intrinsics: list of intrinsic matrices for each camera view
+            lang_goal_emb: language goal embedding
+            lang_token_embs: language token embeddings
+            bounds: optional pre-computed bounds for voxelization
+            prev_bounds: optional bounds from previous layer (for multi-layer setups)
+            prev_layer_voxel_grid: optional voxel grid from previous layer (for multi-layer setups)
+            use_neural_rendering: whether to compute the neural rendering loss
+            nerf_target_rgb: target RGB image for neural rendering loss
+            nerf_target_depth: target depth image for neural rendering loss
+            nerf_target_pose: target camera pose for neural rendering loss
+            nerf_target_camera_intrinsic: target camera intrinsic for neural rendering loss
+            lang_goal: language goal (for neural rendering loss)
+            nerf_next_target_rgb: next target RGB image for neural rendering loss
+            nerf_next_target_pose: next target camera pose for neural rendering loss
+            nerf_next_target_depth: next target depth image for neural rendering loss
+            nerf_next_target_camera_intrinsic: next target camera intrinsic for neural rendering loss
+            gt_embed: ground truth embedding (for neural rendering loss)
+            step: current training step (for neural rendering loss)
+            action: current action (for neural rendering loss)
+        
+        Returns:
+            context: dict output by the flow encoder used for velocity prediction
+            voxel_grid: (B, C, D, H, W) voxel grid of the scene
+            voxel_feat: (B, F) features extracted from the voxel grid by the flow encoder
+            lang_embedd: (B, L) language embedding output by the flow encoder
+            rendering_loss_dict: dictionary of losses from the neural renderer (if use_neural_rendering is True)
+        """
 
         voxel_grid, voxel_feat, lang_embedd, context, bounds = self.encode_scene(
             rgb_pcd, depth, proprio, pcd,
@@ -185,17 +256,6 @@ class QFunctionFlow(nn.Module):
             lang_goal_emb, lang_token_embs,
             bounds, prev_bounds, prev_layer_voxel_grid
         )
-
-        # Predict velocity if noisy_action and timestep are provided
-        pred_velocity = None
-        if noisy_action is not None and timestep is not None:
-            # Unwrap Fabric / DDP wrapper for non-forward method call
-            _enc = (self._flow_encoder.module
-                    if hasattr(self._flow_encoder, 'module')
-                    else self._flow_encoder)
-            pred_velocity = _enc.predict_velocity(
-                noisy_action, timestep, context
-            )
 
         # Neural rendering auxiliary loss (unchanged from manigaussian_bc)
         rendering_loss_dict = {}
@@ -206,7 +266,8 @@ class QFunctionFlow(nn.Module):
 
             focal = camera_intrinsics[0][:, 0, 0]
             cx, cy = 128 / 2, 128 / 2
-            c = torch.tensor([cx, cy], dtype=torch.float32).unsqueeze(0)
+            device = rgb_pcd[0][0].device
+            c = torch.tensor([cx, cy], dtype=torch.float32).unsqueeze(0).to(device)
 
             if nerf_target_rgb is not None:
                 gt_pose  = nerf_target_pose @ self._coord_trans
@@ -232,7 +293,7 @@ class QFunctionFlow(nn.Module):
                     'l1': 0., 'psnr': 0., 'loss_dyna': 0., 'loss_reg': 0.,
                 }
 
-        return pred_velocity, context, voxel_grid, voxel_feat, lang_embedd, rendering_loss_dict
+        return context, voxel_grid, voxel_feat, lang_embedd, rendering_loss_dict
 
     # ------------------------------------------------------------------
     # Inference-only rendering (mirrors manigaussian_bc QFunction.render)
@@ -309,8 +370,8 @@ class ManiFlowBCAgent(Agent):
                  image_resolution: list = None,
                  lambda_weight_l2: float = 1e-6,
                  transform_augmentation: bool = True,
-                 transform_augmentation_xyz: list = None,
-                 transform_augmentation_rpy: list = None,
+                 transform_augmentation_xyz: list = [0.0, 0.0, 0.0],
+                 transform_augmentation_rpy: list = [0.0, 0.0, 180.0],
                  transform_augmentation_rot_resolution: int = 5,
                  optimizer_type: str = 'lamb',
                  num_devices: int = 1,
@@ -357,6 +418,7 @@ class ManiFlowBCAgent(Agent):
 
         self.cfg = cfg
         self.use_neural_rendering = cfg.use_neural_rendering
+        cprint(f"[ManiFlowBCAgent] use_neural_rendering: {self.use_neural_rendering}", "cyan")
 
         # Flow-matching schedulers
         self._pos_scheduler = RFScheduler(noise_sampler="logit_normal",
@@ -429,7 +491,7 @@ class ManiFlowBCAgent(Agent):
                         self._optimizer,
                         num_warmup_steps=self._num_warmup_steps,
                         num_training_steps=self._training_iterations,
-                        num_cycles=self._training_iterations // 10_000,
+                        num_cycles=self._training_iterations // 10000,
                     )
                 )
             logging.info('# ManiFlow Params: %d M' % (
@@ -439,9 +501,18 @@ class ManiFlowBCAgent(Agent):
         else:
             for param in self._q.parameters():
                 param.requires_grad = False
-            self.language_model = create_language_model(self.cfg.language_model)
+            self.language_model = create_language_model(self.cfg.language_model,
+                                                        device=self._device)
             self._voxelizer.to(device)
             self._q.to(device)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @property
+    def _encoder(self) -> VoxelFlowEncoder:
+        """Unwrapped VoxelFlowEncoder (strips Fabric/DDP .module if present)."""
+        return getattr(self._q._flow_encoder, 'module', self._q._flow_encoder)
 
     # ------------------------------------------------------------------
     # Input preprocessing (unchanged from manigaussian_bc)
@@ -449,8 +520,8 @@ class ManiFlowBCAgent(Agent):
     def _preprocess_inputs(self, replay_sample, sample_id=None):
         obs, depths, pcds, exs, ins = [], [], [], [], []
         self._crop_summary = []
-        for n in self._camera_names:
-            if sample_id is not None:
+        for n in self._camera_names:    # default: [front, left_shoulder, right_shoulder, wrist] or [front]
+            if sample_id is not None:   # default: None (training: full batch), int (inference: single sample)
                 sl = slice(sample_id, sample_id + 1)
                 rgb   = replay_sample['%s_rgb' % n][sl]
                 depth = replay_sample['%s_depth' % n][sl]
@@ -522,6 +593,10 @@ class ManiFlowBCAgent(Agent):
         gt_quat = gt_quat / (gt_quat.norm(dim=-1, keepdim=True) + 1e-8)
 
         # ---- Sample a single shared timestep for all components ----------- #
+        # Both pos and rot share the same t so the noisy_action fed to the
+        # Transformer is temporally consistent (one denoising step per forward
+        # pass).  Using a single scheduler to sample avoids the confusion of
+        # having two schedulers that are always called with the same config.
         t = self._pos_scheduler.sample_noise_step(B, device)   # (B,)
 
         # ---- Sample noise ------------------------------------------------- #
@@ -538,10 +613,7 @@ class ManiFlowBCAgent(Agent):
         noisy_action = torch.cat([noisy_pos, noisy_rot, noisy_grip], dim=-1)
 
         # ---- Predict velocity -------------------------------------------- #
-        _enc = (self._q._flow_encoder.module
-                if hasattr(self._q._flow_encoder, 'module')
-                else self._q._flow_encoder)
-        pred_vel = _enc.predict_velocity(noisy_action, t, context)
+        pred_vel = self._encoder.predict_velocity(noisy_action, t, context)
 
         # ---- Ground-truth targets ---------------------------------------- #
         # Position + rotation: flow velocity  v* = noise - x_clean
@@ -599,23 +671,21 @@ class ManiFlowBCAgent(Agent):
 
         # Start from pure noise  (pos + rot only; grip is predicted directly)
         noisy = torch.randn(B, self._action_dim, device=device)
-        noisy[:, 7:8] = 0.0   # grip: init near decision boundary (not random noise)
+        noisy[:, 7:8] = 0.0   # grip: BCE logit head — stays 0.0 throughout the loop
+                              # (consistent with training: noisy_grip is always zeros)
 
         # Unwrap Fabric / DDP wrapper to call non-forward method directly
-        _enc = (self._q._flow_encoder.module
-                if hasattr(self._q._flow_encoder, 'module')
-                else self._q._flow_encoder)
-
         vel = None
         for idx, t_val in enumerate(self._pos_scheduler.timesteps):
             t   = t_val.expand(B)
-            vel = _enc.predict_velocity(noisy, t, context)
+            vel = self._encoder.predict_velocity(noisy, t, context)
 
             pos = self._pos_scheduler.step(vel[:, :3],  idx, noisy[:, :3]).prev_sample
             rot = self._rot_scheduler.step(vel[:, 3:7], idx, noisy[:, 3:7]).prev_sample
-            # Gripper is a direct BCE logit — carry the current noisy grip
-            # forward unchanged so the context (noisy action) stays consistent
-            # across denoising steps.  The final grip is read after the loop.
+            # Gripper is predicted via BCE logit (not via rectified flow).
+            # noisy[:, 7:8] intentionally stays 0.0 so the model always sees the
+            # same neutral gripper input during inference — matching training where
+            # noisy_grip = torch.zeros_like(gt_grip).
             noisy = torch.cat([pos, rot, noisy[:, 7:8]], dim=-1)
 
         # Normalise quaternion
@@ -634,8 +704,12 @@ class ManiFlowBCAgent(Agent):
     # ------------------------------------------------------------------
     def update(self, step: int, replay_sample: dict,
                fabric: Fabric) -> dict:
+        """
+        Update the agent's parameters based on the replay sample.
+        """
+        
         action_gt           = replay_sample['action'].float()   # (B, 8)
-        action_gripper_pose = replay_sample['gripper_pose']
+        action_gripper_pose = replay_sample['gripper_pose'].float()   # (B, 7)
         lang_goal_emb       = replay_sample['lang_goal_emb'].float()
         lang_token_embs     = replay_sample['lang_token_embs'].float()
         prev_layer_voxel_grid = replay_sample.get('prev_layer_voxel_grid', None)
@@ -658,17 +732,23 @@ class ManiFlowBCAgent(Agent):
 
         if (nerf_multi_view_rgb_path is None
                 or nerf_multi_view_rgb_path[0, 0] is None):
+            cprint(nerf_multi_view_rgb_path, 'red')
+            cprint(replay_sample['indices'], 'red')
+            nerf_target_rgb = None
+            nerf_target_camera_extrinsic = None
+            cprint('Warning: NeRF multi-view RGB paths are None. Skipping neural rendering loss for this batch.', 'yellow')
             raise ValueError('nerf_multi_view_rgb_path is None')
 
         num_view         = nerf_multi_view_rgb_path.shape[-1]
         num_view_by_user = self.cfg.num_view_for_nerf
-        assert num_view_by_user <= num_view
-        interval = num_view // num_view_by_user
+        assert num_view_by_user <= num_view, f'num_view_by_user {num_view_by_user} should be less than num_view {num_view}'
+        interval = num_view // num_view_by_user # Sample views at a fixed interval to ensure coverage of all views across batches
         # Subsample all three path arrays consistently (fixes rgb/depth/camera misalignment)
         nerf_multi_view_rgb_path    = nerf_multi_view_rgb_path[:, ::interval]
         nerf_multi_view_depth_path  = nerf_multi_view_depth_path[:, ::interval]
         nerf_multi_view_camera_path = nerf_multi_view_camera_path[:, ::interval]
 
+        # Sample a random view index for each user in the batch, and index into the subsampled paths
         view_idx = np.random.randint(0, num_view_by_user)
         nerf_multi_view_rgb_path    = nerf_multi_view_rgb_path[:, view_idx]
         nerf_multi_view_depth_path  = nerf_multi_view_depth_path[:, view_idx]
@@ -724,37 +804,24 @@ class ManiFlowBCAgent(Agent):
         proprio = replay_sample['low_dim_state'] if self._include_low_dim_state else None
 
         if self._transform_augmentation:
-            # We still augment the point clouds / extrinsics for the GS renderer.
-            # For the flow-matching head we use the raw continuous action.
-            # The SE3 augmentation helper needs (B,3) int trans-indices and
-            # (B,4) int rot-grip-indices; only the gripper-open bit (col 3) is
-            # actually read inside the loop, so derive it from the ground-truth
-            # action and use zero-dummy values for the spatial index columns.
-            bs = action_gt.shape[0]
-            action_trans_dummy    = torch.zeros(bs, 3, dtype=torch.int32, device=self._device)
-            action_rot_grip_dummy = torch.zeros(bs, 4, dtype=torch.int32, device=self._device)
-            action_rot_grip_dummy[:, 3] = (action_gt[:, 7] > 0.5).int()
-            _, _, pcd, extrinsics = apply_se3_augmentation_with_camera_pose(
+            action_gt, pcd, extrinsics = apply_se3_augmentation_continuous(
                 pcd, extrinsics,
                 action_gripper_pose,
-                action_trans_dummy,
-                action_rot_grip_dummy,
+                action_gt,
                 bounds, self._layer,
                 self._transform_augmentation_xyz,
                 self._transform_augmentation_rpy,
-                self._transform_augmentation_rot_resolution,
-                self._voxel_size, 5, self._device,
+                self._device,
             )
 
         # ---- Forward pass -------------------------------------------------
         # First, encode scene to get context (no denoising step needed for loss)
-        (_, context, voxel_grid, voxel_feat,
+        (context, voxel_grid, voxel_feat,
          lang_embedd, rendering_loss_dict) = self._q(
             obs, depth, proprio, pcd,
             extrinsics, intrinsics,
             lang_goal_emb, lang_token_embs,
             bounds, prev_layer_bounds, prev_layer_voxel_grid,
-            noisy_action=None, timestep=None,      # compute flow loss separately
             use_neural_rendering=self.use_neural_rendering,
             nerf_target_rgb=nerf_target_rgb,
             nerf_target_depth=nerf_target_depth,
@@ -858,7 +925,20 @@ class ManiFlowBCAgent(Agent):
                 axs[2].set_title(f'pred psnr={psnr_val:.2f}')
                 for ax in axs: ax.axis('off')
                 plt.tight_layout()
-                plt.savefig(f'recon/{step}_rgb.png')
+                if self.cfg.use_wandb:
+                    buf = io.BytesIO()
+                    plt.savefig(buf, format='png')
+                    buf.seek(0)
+                    image = Image.open(buf)
+                    image.load()  # force PIL to read pixels into memory before buf is closed
+                    wandb.log({'train/recon_img': wandb.Image(image)}, step=step)
+                    buf.close()
+                    workdir = os.getcwd()
+                    cprint(f'Saved {workdir}/recon/{step}_rgb.png to wandb', 'cyan')
+                else:
+                    plt.savefig(f'recon/{step}_rgb.png')
+                    workdir = os.getcwd()
+                    cprint(f'Saved {workdir}/recon/{step}_rgb.png locally', 'cyan')
                 plt.close()
 
         if self._lr_scheduler:
@@ -904,17 +984,22 @@ class ManiFlowBCAgent(Agent):
 
         # Move to device
         obs    = [[o[0][0].to(self._device), o[1][0].to(self._device)] for o in obs]
+        depth  = [d[0].to(self._device) for d in depth]
         proprio = proprio[0].to(self._device) if proprio is not None else None
         pcd    = [p[0].to(self._device) for p in pcd]
+        extrinsics = [e.to(self._device) for e in extrinsics]
+        intrinsics = [i.to(self._device) for i in intrinsics]
         lang_goal_emb   = lang_goal_emb.to(self._device)
         lang_token_embs = lang_token_embs.to(self._device)
         bounds          = torch.as_tensor(bounds, device=self._device)
+        # prev_layer_voxel_grid and prev_layer_bounds are lists of tensors
+        # (appended by act() across layers), not bare tensors — use list comp.
         prev_layer_voxel_grid = (
-            prev_layer_voxel_grid.to(self._device)
+            [v.to(self._device) for v in prev_layer_voxel_grid]
             if prev_layer_voxel_grid is not None else None
         )
         prev_layer_bounds = (
-            prev_layer_bounds.to(self._device)
+            [b.to(self._device) for b in prev_layer_bounds]
             if prev_layer_bounds is not None else None
         )
 

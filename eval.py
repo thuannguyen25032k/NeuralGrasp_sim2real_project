@@ -38,7 +38,8 @@ def eval_seed(train_cfg,
               device_idx,
               multi_task,
               seed,
-              env_config) -> None:
+              env_config,
+              wandb_cfg=None) -> None:
 
     tasks = eval_cfg.rlbench.tasks
     rg = RolloutGenerator()
@@ -151,6 +152,24 @@ def eval_seed(train_cfg,
         logging.info("No weights to evaluate. Results are already available in eval_data.csv")
         sys.exit(0)
 
+    # ---- Initialize W&B in this (main eval) process so all worker subprocesses
+    # can resume into the SAME run regardless of how many parallel workers there
+    # are (eval_envs=5 by default).  Workers resume via the run_id written here.
+    if wandb_cfg is not None and wandb_cfg.get('use_wandb', False):
+        import wandb as _wandb
+        _eval_run = _wandb.init(
+            project=wandb_cfg.get('project', 'manigaussian'),
+            group=wandb_cfg.get('group', 'eval'),
+            name=wandb_cfg.get('name', f'eval_seed{seed}'),
+            config=wandb_cfg.get('train_cfg', {}),
+            resume='allow',
+            id=wandb_cfg.get('run_id', None),
+        )
+        # Overwrite run_id so every worker subprocess resumes into this run.
+        wandb_cfg = dict(wandb_cfg)
+        wandb_cfg['run_id'] = _eval_run.id
+        _wandb.finish()   # close the main-process handle; workers will resume
+
     # evaluate several checkpoints in parallel
     # NOTE: in multi-task settings, each task is evaluated serially, which makes everything slow!
     split_n = utils.split_list(num_weights_to_eval, eval_cfg.framework.eval_envs)
@@ -168,7 +187,8 @@ def eval_seed(train_cfg,
                               device_idx,
                               eval_cfg.framework.eval_save_metrics,
                               eval_cfg.cinematic_recorder,
-                              None))
+                              None),
+                        kwargs={'wandb_cfg': wandb_cfg})
             p.start()
             processes.append(p)        
             
@@ -195,6 +215,24 @@ def main(eval_cfg: DictConfig) -> None:
             train_cfg = OmegaConf.load(f)
     else:
         raise Exception(f"Missing {train_config_path}")
+
+    # ---------------------------------------------------------------------------
+    # Backwards-compatibility: checkpoints saved before the Zarr loader changes
+    # will not have replay.use_zarr_loader (and siblings) in their config.yaml.
+    # Fill in defaults from eval_cfg so nothing crashes during eval.
+    # ---------------------------------------------------------------------------
+    _replay_defaults = OmegaConf.create({
+        'replay': {
+            'use_zarr_loader': False,
+            'zarr_path':       eval_cfg.replay.zarr_path       if 'replay' in eval_cfg else 'data/train_zarr/train.zarr',
+            'zarr_num_workers': eval_cfg.replay.zarr_num_workers if 'replay' in eval_cfg else 4,
+            'zarr_mem_gb':     eval_cfg.replay.zarr_mem_gb     if 'replay' in eval_cfg else 8.0,
+            'zarr_copies':     eval_cfg.replay.zarr_copies     if 'replay' in eval_cfg else 10,
+        }
+    })
+    OmegaConf.set_struct(train_cfg, False)  # allow new keys
+    train_cfg = OmegaConf.merge(_replay_defaults, train_cfg)
+    OmegaConf.set_struct(train_cfg, True)
 
     env_device = utils.get_device(eval_cfg.framework.gpu)
     device_idx = eval_cfg.framework.gpu
@@ -257,6 +295,34 @@ def main(eval_cfg: DictConfig) -> None:
                       eval_cfg.framework.record_every_n)
 
     logging.info('Evaluating seed %d.' % start_seed)
+
+    # ---- Build W&B config (mirrors the training run so metrics land in the same project) ----
+    # train_cfg is a struct DictConfig after set_struct(True) above, so convert
+    # to a plain dict before calling .get() to avoid OmegaConf struct errors.
+    _fw = OmegaConf.to_container(train_cfg.framework, resolve=True)
+    wandb_cfg = None
+    if _fw.get('use_wandb', False):
+        # Try to resume into the same W&B run as training by reading the
+        # persisted run id (written by OfflineTrainRunner on rank 0).
+        _run_id_file = os.path.join(logdir, 'wandb_run_id.txt')
+        _run_id = None
+        if os.path.exists(_run_id_file):
+            with open(_run_id_file) as _f:
+                _run_id = _f.read().strip() or None
+        wandb_cfg = {
+            'use_wandb': True,
+            'project':   _fw.get('wandb_project', 'manigaussian'),
+            # Use the same group as training so eval metrics appear alongside
+            # training curves in W&B.
+            'group':     _fw.get('wandb_group', 'eval'),
+            'name':      f"eval_seed{start_seed}",
+            # eval_seed() will init W&B in the main process and overwrite
+            # run_id for all workers, so all parallel workers log into the
+            # same run regardless of eval_envs count.
+            'run_id':    _run_id,
+            'train_cfg': _fw,
+        }
+
     eval_seed(train_cfg,
               eval_cfg,
               logdir,
@@ -264,7 +330,8 @@ def main(eval_cfg: DictConfig) -> None:
               env_device,
               device_idx,
               multi_task, start_seed,
-              env_config)
+              env_config,
+              wandb_cfg=wandb_cfg)
 
 if __name__ == '__main__':
     main()

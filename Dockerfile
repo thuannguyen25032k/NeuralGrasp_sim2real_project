@@ -43,7 +43,10 @@ RUN ln -sfn /usr/local/cuda-11.7 /usr/local/cuda && \
 WORKDIR /app
 
 # Copy only dependency manifests first if available
-COPY . /app/
+# Copy only dependency manifests first if available
+COPY ./requirements.txt /app/requirements.txt
+COPY ./CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz /app/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
+COPY ./third_party /app/third_party
 
 # ── Python 3.9 + local project venv (standard style) ───────
 RUN uv python install 3.9 \

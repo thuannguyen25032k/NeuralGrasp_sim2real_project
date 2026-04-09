@@ -6,12 +6,12 @@ import pandas as pd
 
 from multiprocessing import Process, Manager
 from multiprocessing import get_start_method, set_start_method
-from typing import Any
+from typing import Any, Optional, Dict
 
 import numpy as np
 import torch
 from yarr.agents.agent import Agent
-from yarr.agents.agent import ScalarSummary
+from yarr.agents.agent import ScalarSummary, VideoSummary
 from yarr.agents.agent import Summary
 from yarr.envs.env import Env
 from yarr.utils.rollout_generator import RolloutGenerator
@@ -118,7 +118,8 @@ class _IndependentEnvRunner(_EnvRunner):
                               device_idx=0,
                               save_metrics=True,
                               cinematic_recorder_cfg=None,
-                              novel_command=None):
+                              novel_command=None,
+                              wandb_cfg: Optional[Dict] = None):
 
         self._name = name
         self._save_metrics = save_metrics
@@ -133,6 +134,20 @@ class _IndependentEnvRunner(_EnvRunner):
 
         with writer_lock: # hack to prevent multiple CLIP downloads ... argh should use a separate lock
             self._agent.build(training=False, device=device)
+
+        # ---- W&B initialisation (eval process) ----------------------------
+        # Each eval worker is a separate subprocess, so wandb must be re-inited here.
+        _use_wandb = wandb_cfg is not None and wandb_cfg.get('use_wandb', False)
+        if _use_wandb:
+            import wandb as _wandb
+            _wandb.init(
+                project=wandb_cfg.get('project', 'manigaussian'),
+                group=wandb_cfg.get('group', 'eval'),
+                name=wandb_cfg.get('name', 'eval'),
+                config=wandb_cfg.get('train_cfg', {}),
+                resume='allow',
+                id=wandb_cfg.get('run_id', None),
+            )
 
         logging.info('%s: Launching env.' % name)
         np.random.seed()
@@ -273,6 +288,28 @@ class _IndependentEnvRunner(_EnvRunner):
                     task_recorder.save(record_file, lang_goal, reward)
                     task_recorder._cam_motion.restore_pose()
 
+                # ---- W&B: upload per-episode rollout video ----------------
+                # VideoSummary is attached to the terminal ReplayTransition by
+                # custom_rlbench_env.step() only when record_current_episode is
+                # True (every record_every_n episodes).  It is always on the
+                # last transition of the episode, so we only check that one.
+                if _use_wandb and episode_rollout:
+                    for s in episode_rollout[-1].summaries:
+                        if isinstance(s, VideoSummary):
+                            success_flag = reward > 0.99
+                            wb_key = (
+                                f'eval/video/{task_name}/'
+                                f'{"success" if success_flag else "fail"}'
+                            )
+                            _wandb.log(
+                                {wb_key: _wandb.Video(
+                                    s.value,   # (T, C, H, W) uint8 numpy array
+                                    fps=s.fps,
+                                    format='mp4',
+                                )},
+                                step=int(weight_name),
+                            )
+
             # report summaries
             summaries = []
             summaries.extend(stats_accumulator.pop())
@@ -298,6 +335,16 @@ class _IndependentEnvRunner(_EnvRunner):
                 with writer_lock:
                     writer.add_summaries(weight_name, summaries)
 
+            # ---- W&B: log per-task eval scalars --------------------------
+            if _use_wandb:
+                wb_scalars = {
+                    f'eval/{s.name}': s.value
+                    for s in summaries
+                    if isinstance(s, ScalarSummary)
+                }
+                if wb_scalars:
+                    _wandb.log(wb_scalars, step=int(weight_name))
+
             self._new_transitions = {'train_envs': 0, 'eval_envs': 0}
             self.agent_summaries[:] = []
             self.stored_transitions[:] = []
@@ -307,6 +354,8 @@ class _IndependentEnvRunner(_EnvRunner):
                 writer.end_iteration()
 
         logging.info('Finished evaluation.')
+        if _use_wandb:
+            _wandb.finish()
         env.shutdown()
 
     def kill(self):

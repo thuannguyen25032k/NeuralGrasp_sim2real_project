@@ -30,7 +30,9 @@ from omegaconf import DictConfig, OmegaConf, ListConfig
 import torch
 import run_seed_fn
 from helpers.utils import create_obs_config
-import lightning as L
+from lightning_fabric import Fabric as _LFabric
+import types
+L = types.SimpleNamespace(Fabric=_LFabric)
 
 
 @hydra.main(config_name='config', config_path='conf')

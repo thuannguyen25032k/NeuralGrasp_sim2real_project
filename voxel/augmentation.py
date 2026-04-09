@@ -377,6 +377,148 @@ def apply_se3_augmentation_with_camera_pose(pcd,
     return action_trans, action_rot_grip, pcd, camera_pose
 
 
+def apply_se3_augmentation_continuous(
+        pcd,
+        camera_pose,
+        action_gripper_pose,
+        action_gt,
+        bounds,
+        layer,
+        trans_aug_range,
+        rot_aug_range,
+        device):
+    """
+    SE3 augmentation for continuous-action agents (e.g. ManiFlow BC).
+
+    Unlike `apply_se3_augmentation_with_camera_pose`, this function:
+      - Transforms the continuous 8-DoF action directly in SE3, avoiding
+        any voxel-index discretization and the associated retry loop.
+      - Returns the augmented action as a float tensor (B, 8)
+        [x, y, z, qx, qy, qz, qw, gripper_open].
+      - Keeps the point-cloud and camera-pose perturbation identical to
+        the original function (needed by the Gaussian-Splatting renderer).
+
+    Parameters
+    ----------
+    pcd               : list of (B, 3, H, W) point clouds per camera
+    camera_pose       : list of (B, 4, 4) camera extrinsic matrices
+    action_gripper_pose : (B, 7) current gripper pose [xyz, qx,qy,qz,qw]
+                          used as the rotation pivot for SE3 perturbation
+    action_gt         : (B, 8) continuous ground-truth action
+                        [x, y, z, qx, qy, qz, qw, gripper_open]
+    bounds            : (B, 6) or (1, 6) workspace bounds [xmin..zmax]
+    layer             : voxelization layer index (0 for single-layer PerAct)
+    trans_aug_range   : (3,) tensor, fraction of workspace to use as shift range
+    rot_aug_range     : list [roll_deg, pitch_deg, yaw_deg] max rotation
+                        Sampled continuously (uniform) — no discretization.
+    device            : torch device
+
+    Returns
+    -------
+    action_gt_aug  : (B, 8) augmented continuous action (same dtype as input)
+    pcd_aug        : list of perturbed point clouds
+    camera_pose_aug: list of perturbed camera extrinsics
+    """
+    bs = pcd[0].shape[0]
+    identity_4x4 = torch.eye(4).unsqueeze(0).repeat(bs, 1, 1).to(device=device)
+
+    # ---- Build 4x4 matrix from current gripper pose (rotation pivot) ----
+    action_gripper_trans = action_gripper_pose[:, :3]
+    action_gripper_quat_wxyz = torch.cat(
+        (action_gripper_pose[:, 6].unsqueeze(1), action_gripper_pose[:, 3:6]), dim=1
+    )
+    action_gripper_rot   = torch3d_tf.quaternion_to_matrix(action_gripper_quat_wxyz)
+    action_gripper_4x4   = identity_4x4.detach().clone()
+    action_gripper_4x4[:, :3, :3] = action_gripper_rot
+    action_gripper_4x4[:, 0:3, 3] = action_gripper_trans
+
+    # ---- Sample random SE3 perturbation ----------------------------------
+    trans_range  = (bounds[:, 3:] - bounds[:, :3]) * trans_aug_range.to(device=device)
+    trans_shift  = trans_range * utils.rand_dist((bs, 3)).to(device=device)
+    trans_shift_4x4 = identity_4x4.detach().clone()
+    trans_shift_4x4[:, 0:3, 3] = trans_shift
+
+    # Continuous uniform sampling — no discretization needed for a continuous-action agent.
+    # rot_aug_range gives the max absolute angle in degrees per axis.
+    # Tensors are created directly on `device` to avoid a CPU→GPU copy error.
+    roll  = ((torch.rand(bs, 1, device=device) * 2 - 1) * np.deg2rad(rot_aug_range[0]))
+    pitch = ((torch.rand(bs, 1, device=device) * 2 - 1) * np.deg2rad(rot_aug_range[1]))
+    yaw   = ((torch.rand(bs, 1, device=device) * 2 - 1) * np.deg2rad(rot_aug_range[2]))
+
+    rot_shift_3x3 = torch3d_tf.euler_angles_to_matrix(
+        torch.cat((roll, pitch, yaw), dim=1), "XYZ"
+    )
+    rot_shift_4x4 = identity_4x4.detach().clone()
+    rot_shift_4x4[:, :3, :3] = rot_shift_3x3
+
+    # ---- Apply the same SE3 perturbation to the TARGET action (action_gt) --------
+    # The scene perturbation in perturb_se3 applies this to every world-frame point p:
+    #
+    #   p' = bmm(p^T, rot_shift_4x4)^T + clamp(t_pivot + t_shift)
+    #      = rot_shift_4x4^T * (p - t_pivot) + clamp(t_pivot + t_shift)
+    #      = R_delta^T * (p - t_pivot) + clamp(t_pivot + t_shift)
+    #
+    # where R_delta = rot_shift_4x4[:, :3, :3]  (pytorch3d euler_angles_to_matrix output,
+    # a standard column-vector rotation matrix), and t_pivot = action_gripper xyz.
+    #
+    # The same transformation must be applied to action_gt:
+    #   aug_pos = R_delta^T * (t_action_gt - t_pivot) + clamp(t_pivot + t_shift)
+    #   aug_rot = R_delta^T * R_action_gt    (left-multiply = same world-frame rotation)
+
+    # Build action_gt rotation matrix from quaternion (xyzw → wxyz for pytorch3d)
+    action_gt_quat_xyzw = action_gt[:, 3:7]                                   # (B, 4) xyzw
+    action_gt_quat_wxyz = torch.cat(
+        [action_gt_quat_xyzw[:, 3:4], action_gt_quat_xyzw[:, :3]], dim=1
+    )                                                                           # (B, 4) wxyz
+    action_gt_rot = torch3d_tf.quaternion_to_matrix(action_gt_quat_wxyz)       # (B, 3, 3)
+
+    # R_delta^T — matches the row-vector bmm transpose used in perturb_se3.
+    # Use rot_shift_3x3 directly (already computed above); do NOT re-read from rot_shift_4x4
+    # to avoid accidental aliasing if rot_shift_4x4 were ever modified.
+    rot_shift_3x3_T = rot_shift_3x3.transpose(1, 2)                           # (B, 3, 3) = R_delta^T
+
+    # Rotation: aug_R = R_delta^T * R_action_gt
+    aug_rot = torch.bmm(rot_shift_3x3_T, action_gt_rot)                        # (B, 3, 3)
+
+    # Position: R_delta^T * (t_action_gt - t_pivot) + clamp(t_pivot + t_shift)
+    t_pivot  = action_gripper_4x4[:, 0:3, 3]                                  # (B, 3)
+    t_action = action_gt[:, :3]                                                # (B, 3)
+    offset   = t_action - t_pivot                                              # (B, 3)
+    aug_offset = torch.einsum('bij,bj->bi', rot_shift_3x3_T, offset)          # (B, 3)
+
+    # Clamp the new pivot (t_pivot + t_shift) exactly as perturb_se3 does:
+    # it uses global min/max across the batch, so we must match that here.
+    if bounds.shape[0] != bs:
+        bounds = bounds.repeat(bs, 1)
+    bounds_x_min, bounds_x_max = bounds[:, 0].min(), bounds[:, 3].max()
+    bounds_y_min, bounds_y_max = bounds[:, 1].min(), bounds[:, 4].max()
+    bounds_z_min, bounds_z_max = bounds[:, 2].min(), bounds[:, 5].max()
+    new_pivot = t_pivot + trans_shift                                          # (B, 3)
+    new_pivot = torch.stack([
+        new_pivot[:, 0].clamp(bounds_x_min, bounds_x_max),
+        new_pivot[:, 1].clamp(bounds_y_min, bounds_y_max),
+        new_pivot[:, 2].clamp(bounds_z_min, bounds_z_max),
+    ], dim=1)
+    aug_pos = aug_offset + new_pivot                                           # (B, 3)
+
+    # Convert aug_rot back to quaternion: pytorch3d returns wxyz, action layout needs xyzw
+    aug_quat_wxyz = torch3d_tf.matrix_to_quaternion(aug_rot)                   # (B, 4) wxyz
+    aug_quat_xyzw = torch.cat(
+        [aug_quat_wxyz[:, 1:], aug_quat_wxyz[:, 0:1]], dim=1
+    )                                                                           # (B, 4) xyzw
+
+    # Gripper open/close is scene-invariant — keep unchanged
+    aug_grip = action_gt[:, 7:8]
+
+    action_gt_aug = torch.cat([aug_pos, aug_quat_xyzw, aug_grip], dim=-1)
+
+    # ---- Apply same perturbation to point clouds and camera poses --------
+    pcd_aug         = perturb_se3(pcd, trans_shift_4x4, rot_shift_4x4, action_gripper_4x4, bounds)
+    camera_pose_aug = perturb_se3_camera_pose(camera_pose, trans_shift_4x4, rot_shift_4x4, action_gripper_4x4, bounds)
+
+    return action_gt_aug, pcd_aug, camera_pose_aug
+
+
 ### ref: https://github.com/vlc-robot/polarnet
 # NOT USED
 def random_rotate_pcd_and_action(pcd, action, rot_range, rot=None):

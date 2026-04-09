@@ -30,7 +30,7 @@ import multiprocessing as mp
 from torch.multiprocessing import Process, Value, Manager
 from omegaconf import DictConfig
 from termcolor import colored, cprint
-from lightning.fabric import Fabric
+from lightning_fabric import Fabric
 
 
 REWARD_SCALE = 100.0
@@ -410,7 +410,7 @@ def create_agent(cfg: DictConfig):
             depth=cfg.method.transformer_depth, # 6
             iterations=cfg.method.transformer_iterations,
             voxel_size=vox_size,
-            initial_dim=3 + 3 + 1 + 3,
+            initial_dim=3 + 3 + 1 + 3,  
             low_dim_size=4,
             layer=depth,
             num_rotation_classes=num_rotation_classes if last else 0,

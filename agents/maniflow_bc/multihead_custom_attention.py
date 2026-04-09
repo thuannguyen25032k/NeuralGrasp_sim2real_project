@@ -127,6 +127,8 @@ def multi_head_attention_forward(query,
     )  # B H S D
     attn_output = einops.rearrange(attn_output, "B H S D -> S B (H D)")
     attn_output = F.linear(attn_output, out_proj_weight, out_proj_bias)
-    attn_output = F.dropout(attn_output, p=dropout_p, training=training)
+    # NOTE: dropout is intentionally NOT applied here; AttentionLayer already
+    # wraps the output in self.dropout before the residual add.  Applying it
+    # here too would double the effective dropout rate.
 
     return attn_output, None
