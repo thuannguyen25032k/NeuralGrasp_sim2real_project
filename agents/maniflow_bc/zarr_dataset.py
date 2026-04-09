@@ -21,6 +21,7 @@ Disk schema (written by convert_replay_to_zarr.py):
     low_dim_state  (N, 4)               float32
     action         (N, 8)               float32    [xyz qxyz_w grip]
     gripper_pose   (N, 7)               float32
+    ignore_collisions (N, 1)            float32
     lang_goal_emb  (N, 1024)            float32
     lang_token_embs(N, 77, D)           float32
     task           (N,)                 str / bytes
@@ -53,7 +54,7 @@ import zarr
 from zarr.storage import DirectoryStore
 from zarr import LRUStoreCache
 
-import utils.pytorch3d_transforms as pytorch3d_transforms  # already in repo
+import pytorch3d.transforms as pytorch3d_transforms
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +223,7 @@ class ManiFlowZarrDataset(Dataset):
         sample["low_dim_state"]  = _get("low_dim_state").float()    # (4,)
         sample["gripper_pose"]   = gripper_pose                      # (7,)
         sample["action"]         = action                            # (8,)
+        sample["ignore_collisions"] = _get("ignore_collisions").float()  # (1,)
         sample["lang_goal_emb"]  = _get("lang_goal_emb").float()    # (1024,)
         sample["lang_token_embs"] = _get("lang_token_embs").float() # (77, D)
         sample["task"]           = str(self._z["task"][idx].flat[0])

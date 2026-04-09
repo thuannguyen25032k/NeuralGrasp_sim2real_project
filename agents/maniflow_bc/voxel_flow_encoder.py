@@ -636,12 +636,12 @@ class VoxelFlowEncoder(nn.Module):
             proprio_feats = None
 
         return self.transformer_head(
-            noisy_action=noisy_action,
-            timestep=t,
-            voxel_tokens=voxel_tokens,
-            voxel_pos=voxel_pos,
-            lang_tokens=lang_tokens,
-            proprio_feats=proprio_feats,
+            noisy_action=noisy_action.float(),
+            timestep=t.float(),
+            voxel_tokens=voxel_tokens.float(),
+            voxel_pos=voxel_pos.float(),
+            lang_tokens=lang_tokens.float(),
+            proprio_feats=proprio_feats.float() if proprio_feats is not None else None,
         )
 
     # ---------------------------------------------------------------------- #

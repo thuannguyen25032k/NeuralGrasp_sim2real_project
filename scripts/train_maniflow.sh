@@ -44,10 +44,7 @@ flow_hidden_dim=512
 flow_num_layers=4
 # ----------------------------------------------------------------------------
 
-# python_exec="/app/.venv/bin/python"
-# if [ ! -x "${python_exec}" ]; then
-# 	python_exec="python"
-# fi
+echo "Starting ManiFlow training with method: ${method}, seed: ${seed}, num_devices: ${#train_gpu_list[@]}, port: ${port}, exp_name: ${exp_name}" | tee -a "${log_file}"
 
 train_cmd=(
 	"uv" "run" "train.py"
@@ -69,7 +66,7 @@ train_cmd=(
     "method.neural_renderer.lambda_embed=0.0"
     "method.neural_renderer.lambda_dyna=${lambda_dyna}"
     "method.neural_renderer.lambda_reg=${lambda_reg}"
-    "method.neural_renderer.foundation_model_name=null"
+    "method.neural_renderer.foundation_model_name=diffusion"
     "method.neural_renderer.use_dynamic_field=True"
     "method.denoise_timesteps=${denoise_timesteps}"
     "method.flow_context_dim=${flow_context_dim}"

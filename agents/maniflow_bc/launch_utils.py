@@ -125,6 +125,9 @@ def create_replay(batch_size: int, timesteps: int,
     #  - language goal (for analysis; stored as object since it can be variable-length string)
     # ---------------------------------------------------------------------------
     observation_elements.extend([
+        # ignore_collisions flag has shape (1,) and indicates whether the transition involved a collision
+        ReplayElement('ignore_collisions',
+                      (ignore_collisions_size,),           np.float32),
         # gripper pose has shape (7,) to be compatible with PyTorch ConvNets
         ReplayElement('gripper_pose',
                       (gripper_pose_size,),               np.float32),

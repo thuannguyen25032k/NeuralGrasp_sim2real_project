@@ -151,6 +151,9 @@ def process_demo(demo, episode_keypoints, cameras, language_model, description,
 
         nview = max(len(nerf_rgb_p), 1)
 
+        # ---- Ignore collisions flag ----------------------------------------
+        ignore_collisions = np.array([float(obs.ignore_collisions)], dtype=np.float32)
+
         prev_action = action.copy()
 
         # ---- Write to zarr ------------------------------------------------
@@ -163,6 +166,7 @@ def process_demo(demo, episode_keypoints, cameras, language_model, description,
         _create_or_append(zarr_file, "low_dim_state", low_dim_state[i], (low_dim_state.shape[0],), "float32")
         _create_or_append(zarr_file, "action",        action[i],   (8,),            "float32")
         _create_or_append(zarr_file, "gripper_pose",  obs_tp1.gripper_pose[i], (7,), "float32")
+        _create_or_append(zarr_file, "ignore_collisions", ignore_collisions[i], (1,), "float32")
         _create_or_append(zarr_file, "lang_goal_emb",   lang_goal_emb[i],   (1024,),                  "float32")
         _create_or_append(zarr_file, "lang_token_embs", lang_token_embs[i], (lang_token_embs.shape[0],
                                                                               lang_token_embs.shape[1]), "float32")

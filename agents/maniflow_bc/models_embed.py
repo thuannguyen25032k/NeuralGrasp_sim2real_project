@@ -241,16 +241,20 @@ class GeneralizableGSEmbedNet(nn.Module):
         features_dc_maps = features_dc_maps.unsqueeze(2) #.transpose(2, 1).contiguous().unsqueeze(2) # [B, H*W, 1, 3]
         features_rest_maps = features_rest_maps.reshape(*features_rest_maps.shape[:2], -1, 3) # [B, H*W, 3, 3]
         sh_out = torch.cat([features_dc_maps, features_rest_maps], dim=2)  # [B, H*W, 4, 3]
+        # Clamp SH coefficients: large values overflow the CUDA SH-to-RGB
+        # backward kernel and cause an illegal memory access crash.
+        sh_out = torch.clamp(sh_out, -3.0, 3.0)
 
         scale_maps = self.scaling_activation(scale_maps)    # exp
-        scale_maps = torch.clamp_max(scale_maps, 0.05)
+        # Clamp scale: zero/negative scale → singular covariance → CUDA crash.
+        scale_maps = torch.clamp(scale_maps, 1e-6, 0.05)
 
         data['xyz_maps'] = data['xyz'] + xyz_maps   # [B, N, 3]
         data['sh_maps'] = sh_out    # [B, N, 4, 3]
         data['rot_maps'] = self.rotation_activation(rot_maps, dim=-1)
         data['scale_maps'] = scale_maps
         data['opacity_maps'] = self.opacity_activation(opacity_maps)
-        data['feature_maps'] = feature_maps # [B, N, 3]
+        data['feature_maps'] = feature_maps  # [B, N, 3]
 
         # Dynamic Modeling: predict next gaussian maps
         if self.use_dynamic_field: #and data['step'] >= self.warm_up:

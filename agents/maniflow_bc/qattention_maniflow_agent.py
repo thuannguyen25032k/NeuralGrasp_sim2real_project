@@ -14,6 +14,7 @@ Loss: flow-matching velocity prediction (L1) on position/rotation +
 
 import logging
 import os
+import warnings
 from typing import List
 
 import numpy as np
@@ -22,6 +23,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 
+# matplotlib internally uses an old pyparsing API that emits
+# PyparsingDeprecationWarning on every import.  Suppress once at module load.
+with warnings.catch_warnings():
+    warnings.filterwarnings('ignore', message='.*parseString.*')
+    warnings.filterwarnings('ignore', message='.*resetCache.*')
+    warnings.filterwarnings('ignore', message='.*enablePackrat.*')
+    import matplotlib
+    matplotlib.use('Agg')   # non-interactive backend — safe in Docker / headless
+    import matplotlib.pyplot as plt
+
 from yarr.agents.agent import Agent, ActResult, ScalarSummary, \
     HistogramSummary, ImageSummary, Summary
 from termcolor import colored, cprint
@@ -29,8 +40,7 @@ import io
 
 from helpers.utils import visualise_voxel
 from voxel.voxel_grid import VoxelGrid
-from voxel.augmentation import (apply_se3_augmentation_with_camera_pose,
-                                 apply_se3_augmentation_continuous)
+from voxel.augmentation import apply_se3_augmentation_continuous
 from helpers.clip.core.clip import build_model, load_clip
 import PIL.Image as Image
 import transformers
@@ -94,6 +104,23 @@ def _parse_depth_file(file_path):
     The depth image is expected to be in a single-channel format (e.g., 16-bit PNG),"""
     d = Image.open(file_path).convert('L')
     return np.asarray(d).astype(np.float32)
+
+
+def visualize_feature_map_by_normalization(features):
+    """
+    Normalize a feature map to [0, 1] range for display.
+    features: (B, C, H, W)  — takes first batch element
+    Returns:  (H, W, C) numpy array in [0, 1]
+    """
+    MIN_DENOMINATOR = 1e-12
+    features = features[0].cpu().detach().numpy()   # (C, H, W)
+    features = features.transpose(1, 2, 0)           # (H, W, C)
+    features = features / (
+        np.linalg.norm(features, axis=-1, keepdims=True) + MIN_DENOMINATOR
+    )
+    # shift from [-1, 1] → [0, 1] for imshow
+    features = (features - features.min()) / (features.max() - features.min() + MIN_DENOMINATOR)
+    return features
 
 
 # ---------------------------------------------------------------------------
@@ -437,8 +464,20 @@ class ManiFlowBCAgent(Agent):
     def build(self, training: bool, device: torch.device = None,
               use_ddp: bool = True, fabric: Fabric = None):
         self._training = training
-        self._device   = device or torch.device('cpu')
-        device         = self._device
+        # `device or torch.device('cpu')` is WRONG when device=0 (int from
+        # fabric.global_rank): bool(0)==False → evaluates to cpu.
+        # Explicitly map: None→cpu, int→cuda:N, else pass through.
+        if device is None:
+            self._device = torch.device('cpu')
+        elif isinstance(device, int):
+            self._device = torch.device(f'cuda:{device}')
+        else:
+            self._device = torch.device(device)
+        # Pin CUDA context to the correct GPU (per-process), matching
+        # the GitHub forum recommendation for diff_gaussian_rasterization.
+        if self._device.type == 'cuda':
+            torch.cuda.set_device(self._device)
+        device = self._device
 
         self._voxelizer = VoxelGrid(
             coord_bounds=self._coordinate_bounds.cpu()
@@ -505,6 +544,12 @@ class ManiFlowBCAgent(Agent):
                                                         device=self._device)
             self._voxelizer.to(device)
             self._q.to(device)
+
+        # Initialise summary dicts so update_summaries / update_wandb_summaries
+        # are safe to call before the first update() (e.g. at step 0).
+        self._summaries        = {}
+        self._wandb_summaries  = {}
+        self._crop_summary     = []
 
     # ------------------------------------------------------------------
     # Helpers
@@ -708,18 +753,25 @@ class ManiFlowBCAgent(Agent):
         Update the agent's parameters based on the replay sample.
         """
         
-        action_gt           = replay_sample['action'].float()   # (B, 8)
-        action_gripper_pose = replay_sample['gripper_pose'].float()   # (B, 7)
-        lang_goal_emb       = replay_sample['lang_goal_emb'].float()
-        lang_token_embs     = replay_sample['lang_token_embs'].float()
+        device = self._device
+        rank   = fabric.global_rank   # int (0 on main process)
+
+        action_gt           = replay_sample['action'].float().to(device)   # (B, 8)
+        action_gripper_pose = replay_sample['gripper_pose'].float().to(device)   # (B, 7)
+        lang_goal_emb       = replay_sample['lang_goal_emb'].float().to(device)
+        lang_token_embs     = replay_sample['lang_token_embs'].float().to(device)
         prev_layer_voxel_grid = replay_sample.get('prev_layer_voxel_grid', None)
         prev_layer_bounds     = replay_sample.get('prev_layer_bounds', None)
         lang_goal             = replay_sample['lang_goal']
 
-        device = self._device
-        rank   = fabric.global_rank   # int (0 on main process)
-
         obs, depth, pcd, extrinsics, intrinsics = self._preprocess_inputs(replay_sample)
+        # Move all per-camera tensors to the training device so that SE3
+        # augmentation and the forward pass see a consistent device.
+        pcd        = [p.to(device) for p in pcd]
+        extrinsics = [e.to(device) for e in extrinsics]
+        intrinsics = [i.to(device) for i in intrinsics]
+        depth      = [d.to(device) for d in depth]
+        obs        = [[rgb.to(device), pc.to(device)] for rgb, pc in obs]
         bs = pcd[0].shape[0]
 
         # ---- Load NeRF multi-view data (same as manigaussian_bc) ----------
@@ -797,11 +849,11 @@ class ManiFlowBCAgent(Agent):
         # ---- Scene bounds and optional SE3 augmentation ------------------
         bounds = self._coordinate_bounds.to(device)
         if self._layer > 0:
-            cp     = replay_sample['attention_coordinate_layer_%d' % (self._layer - 1)]
+            cp     = replay_sample['attention_coordinate_layer_%d' % (self._layer - 1)].to(device)
             bounds = torch.cat([cp - self._bounds_offset,
                                 cp + self._bounds_offset], dim=1)
 
-        proprio = replay_sample['low_dim_state'] if self._include_low_dim_state else None
+        proprio = replay_sample['low_dim_state'].float().to(device) if self._include_low_dim_state else None
 
         if self._transform_augmentation:
             action_gt, pcd, extrinsics = apply_se3_augmentation_continuous(
@@ -871,6 +923,8 @@ class ManiFlowBCAgent(Agent):
                         'train/psnr': psnr,
                         'train/rgb_loss': loss_rgb,
                         'train/embed_loss': loss_embed,
+                        'train/dyna_loss': loss_dyna,
+                        'train/reg_loss': loss_reg,
                     }, step=step)
             else:
                 cprint(
@@ -883,6 +937,10 @@ class ManiFlowBCAgent(Agent):
 
         self._optimizer.zero_grad()
         fabric.backward(total_loss)
+        # Clip gradients: unbounded gradients through the GS rasterizer backward
+        # (from large SH / xyz values early in training) cause CUDA illegal memory
+        # access that surfaces asynchronously on the next CUDA call.
+        torch.nn.utils.clip_grad_norm_(self._q.parameters(), max_norm=10.0)
         self._optimizer.step()
 
         # ---- Optional render preview (same cadence as manigaussian_bc) ---
@@ -910,28 +968,61 @@ class ManiFlowBCAgent(Agent):
                 nerf_next_target_camera_intrinsic=nerf_next_target_cam_intr,
                 step=step, action=action_gt,
             )
+
+            # NOTE: [h, w, 3] — take first batch element
+            rgb_gt       = nerf_target_rgb[0]
+            rgb_render   = rgb_render[0]
+            psnr_val     = _PSNR_torch(rgb_render, rgb_gt)
+            psnr_dyna    = None
+            if next_rgb_render is not None:
+                next_rgb_gt     = nerf_next_target_rgb[0]
+                next_rgb_render = next_rgb_render[0]
+                psnr_dyna       = _PSNR_torch(next_rgb_render, next_rgb_gt)
+
             if rank == 0:
-                import matplotlib.pyplot as plt
-                rgb_gt     = nerf_target_rgb[0]
-                rgb_pred   = rgb_render[0]
-                psnr_val   = _PSNR_torch(rgb_pred, rgb_gt)
                 os.makedirs('recon', exist_ok=True)
-                fig, axs = plt.subplots(1, 3, figsize=(9, 3))
-                axs[0].imshow(obs[0][0].squeeze(0).permute(1, 2, 0).cpu().numpy() / 2 + 0.5)
+                rgb_src = obs[0][0].squeeze(0).permute(1, 2, 0).cpu() / 2 + 0.5
+
+                fig, axs = plt.subplots(1, 7, figsize=(21, 3))
+                # 0: input view
+                axs[0].imshow(rgb_src.numpy())
                 axs[0].set_title('src')
+                # 1: target GT
                 axs[1].imshow(rgb_gt.cpu().numpy())
                 axs[1].set_title('tgt')
-                axs[2].imshow(rgb_pred.cpu().numpy())
-                axs[2].set_title(f'pred psnr={psnr_val:.2f}')
-                for ax in axs: ax.axis('off')
+                # 2: predicted RGB
+                axs[2].imshow(rgb_render.cpu().numpy())
+                axs[2].set_title(f'psnr={psnr_val:.2f}')
+                # 3: predicted feature/embed (normalised for display)
+                if embed_render is not None:
+                    embed_vis = visualize_feature_map_by_normalization(
+                        embed_render.permute(0, 3, 1, 2))
+                    axs[3].imshow(embed_vis)
+                axs[3].set_title('embed pred')
+                # 4: GT embed (only available when a foundation model is configured)
+                if gt_embed_render is not None:
+                    gt_embed_vis = visualize_feature_map_by_normalization(gt_embed_render)
+                    axs[4].imshow(gt_embed_vis)
+                axs[4].set_title('embed gt')
+                # 5: next-frame prediction (dynamic field)
+                if next_rgb_render is not None:
+                    axs[5].imshow(next_rgb_render.cpu().numpy())
+                    axs[5].set_title(f'next psnr={psnr_dyna:.2f}')
+                # 6: next-frame GT
+                if next_rgb_render is not None:
+                    axs[6].imshow(next_rgb_gt.cpu().numpy())
+                axs[6].set_title('next tgt')
+                for ax in axs:
+                    ax.axis('off')
                 plt.tight_layout()
+
                 if self.cfg.use_wandb:
                     buf = io.BytesIO()
                     plt.savefig(buf, format='png')
                     buf.seek(0)
                     image = Image.open(buf)
-                    image.load()  # force PIL to read pixels into memory before buf is closed
-                    wandb.log({'train/recon_img': wandb.Image(image)}, step=step)
+                    image.load()  # force PIL to read before buf closes
+                    wandb.log({'eval/recon_img': wandb.Image(image)}, step=step)
                     buf.close()
                     workdir = os.getcwd()
                     cprint(f'Saved {workdir}/recon/{step}_rgb.png to wandb', 'cyan')
@@ -948,6 +1039,15 @@ class ManiFlowBCAgent(Agent):
             'losses/total_loss': total_loss.item(),
             'losses/flow_loss':  flow_loss.item(),
         }
+        if self.use_neural_rendering and rendering_loss_dict:
+            self._summaries['losses/rgb_loss']   = rendering_loss_dict['loss_rgb']
+            self._summaries['losses/embed_loss'] = rendering_loss_dict['loss_embed']
+            self._summaries['losses/dyna_loss']  = rendering_loss_dict.get('loss_dyna', 0.)
+            self._summaries['losses/reg_loss']   = rendering_loss_dict.get('loss_reg',  0.)
+            self._summaries['psnr']              = rendering_loss_dict['psnr']
+
+        self._wandb_summaries = dict(self._summaries)
+
         self._vis_voxel_grid = voxel_grid[0]
 
         if prev_layer_voxel_grid is None:
@@ -1049,6 +1149,9 @@ class ManiFlowBCAgent(Agent):
         summaries = []
         for n, v in self._summaries.items():
             summaries.append(ScalarSummary('%s/%s' % (self._name, n), v))
+        for (name, crop) in self._crop_summary:
+            crops = (torch.cat(torch.split(crop, 3, dim=1), dim=3) + 1.0) / 2.0
+            summaries.append(ImageSummary('%s/crops/%s' % (self._name, name), crops))
         for tag, param in self._q.named_parameters():
             if param.grad is None:
                 continue
@@ -1059,7 +1162,7 @@ class ManiFlowBCAgent(Agent):
         return summaries
 
     def update_wandb_summaries(self):
-        return dict(self._summaries)
+        return dict(self._wandb_summaries)
 
     def act_summaries(self) -> List[Summary]:
         return []
