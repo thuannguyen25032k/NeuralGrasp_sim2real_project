@@ -33,8 +33,12 @@ class ManiFlowStackAgent(Agent):
 
     # ------------------------------------------------------------------
     def update(self, step: int, replay_sample: dict, **kwargs) -> dict:
-        if (replay_sample['nerf_multi_view_rgb'] is None
-                or replay_sample['nerf_multi_view_rgb'][0, 0] is None):
+        nerf_rgb = replay_sample.get('nerf_multi_view_rgb')
+        try:
+            _no_nerf = nerf_rgb is None or nerf_rgb[0, 0] is None
+        except (TypeError, IndexError, KeyError):
+            _no_nerf = True
+        if _no_nerf:
             cprint("ManiFlowStackAgent: no nerf rgb in sample", "red")
 
         total_losses = 0.
@@ -71,11 +75,13 @@ class ManiFlowStackAgent(Agent):
             observation['attention_coordinate'] = (
                 act_results.observation_elements['attention_coordinate']
             )
+            # prev_layer_voxel_grid / prev_layer_bounds live in `info` to
+            # avoid YARR's rollout_generator calling np.array() on them.
             observation['prev_layer_voxel_grid'] = (
-                act_results.observation_elements['prev_layer_voxel_grid']
+                act_results.info['prev_layer_voxel_grid']
             )
             observation['prev_layer_bounds'] = (
-                act_results.observation_elements['prev_layer_bounds']
+                act_results.info['prev_layer_bounds']
             )
             infos.update(act_results.info)
 

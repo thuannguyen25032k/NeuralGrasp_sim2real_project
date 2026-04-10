@@ -20,6 +20,10 @@ cur_dir=$(pwd)
 train_demo_path="${cur_dir}/data/train_data"
 test_demo_path="${cur_dir}/data/test_data"
 
+# Zarr data paths (disk-based — no YARR replay buffer for ManiFlow_BC)
+zarr_path="${cur_dir}/data/train_zarr/train.zarr"
+zarr_instructions="${cur_dir}/data/train_zarr/instructions.json"
+
 addition_info="$(date +%Y%m%d)"
 exp_name=${3:-"${method}_${addition_info}"}
 replay_dir="${cur_dir}/replay/${exp_name}"
@@ -30,6 +34,8 @@ log_file="${log_dir}/${exp_name}_$(date +%Y%m%d_%H%M%S).log"
 echo "Log file: ${log_file}"
 
 # ---- Hyperparameters -------------------------------------------------------
+# The Gaussian Splatting renderer requires batch_size=1 (same constraint as
+# ManiGaussian_BC).  Set to 1 when use_neural_rendering=True (default).
 batch_size=1
 tasks=[light_bulb_in,put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,place_shape_in_shape_sorter,push_buttons,insert_onto_square_peg,stack_cups,place_cups]
 demo=20
@@ -52,6 +58,8 @@ train_cmd=(
     "rlbench.task_name=${exp_name}"
     "rlbench.demo_path=${train_demo_path}"
     "replay.path=${replay_dir}"
+    "replay.zarr_path=${zarr_path}"
+    "replay.zarr_instructions=${zarr_instructions}"
     "framework.start_seed=${seed}"
     "framework.use_wandb=${use_wandb}"
     "method.use_wandb=${use_wandb}"
@@ -76,6 +84,10 @@ train_cmd=(
 
 echo "Running ManiFlow training in foreground." | tee -a "${log_file}"
 echo "CUDA_VISIBLE_DEVICES=${train_gpu} ${train_cmd[*]}" | tee -a "${log_file}"
+
+# Prepend our local YARR so it shadows the venv-installed version.
+# This ensures offline_train_runner (with zarr_loader support) is used.
+export PYTHONPATH="${cur_dir}/third_party/YARR:${PYTHONPATH}"
 
 CUDA_VISIBLE_DEVICES="${train_gpu}" "${train_cmd[@]}" 2>&1 | tee -a "${log_file}"
 train_exit=${PIPESTATUS[0]}
