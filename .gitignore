@@ -10,7 +10,7 @@ test/
 .vscode
 output
 build
-
+*.pt
 ####
 tmp_dir/
 tmp_img_dir/
