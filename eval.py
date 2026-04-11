@@ -38,8 +38,7 @@ def eval_seed(train_cfg,
               device_idx,
               multi_task,
               seed,
-              env_config,
-              wandb_cfg=None) -> None:
+              env_config) -> None:
 
     tasks = eval_cfg.rlbench.tasks
     rg = RolloutGenerator()
@@ -67,6 +66,10 @@ def eval_seed(train_cfg,
     cwd = os.getcwd()
     weightsdir = os.path.join(logdir, 'weights')
 
+    # Always use the training episode_length so the time-in-state encoding
+    # seen at eval matches exactly what the model was trained on.
+    episode_length = train_cfg.rlbench.episode_length
+
     env_runner = IndependentEnvRunner(
         train_env=None,
         agent=agent,
@@ -77,7 +80,7 @@ def eval_seed(train_cfg,
         eval_episodes=eval_cfg.framework.eval_episodes,
         training_iterations=train_cfg.framework.training_iterations,
         eval_from_eps_number=eval_cfg.framework.eval_from_eps_number,
-        episode_length=eval_cfg.rlbench.episode_length,
+        episode_length=episode_length,
         stat_accumulator=stat_accum,
         weightsdir=weightsdir,
         logdir=logdir,
@@ -152,24 +155,6 @@ def eval_seed(train_cfg,
         logging.info("No weights to evaluate. Results are already available in eval_data.csv")
         sys.exit(0)
 
-    # ---- Initialize W&B in this (main eval) process so all worker subprocesses
-    # can resume into the SAME run regardless of how many parallel workers there
-    # are (eval_envs=5 by default).  Workers resume via the run_id written here.
-    if wandb_cfg is not None and wandb_cfg.get('use_wandb', False):
-        import wandb as _wandb
-        _eval_run = _wandb.init(
-            project=wandb_cfg.get('project', 'manigaussian'),
-            group=wandb_cfg.get('group', 'eval'),
-            name=wandb_cfg.get('name', f'eval_seed{seed}'),
-            config=wandb_cfg.get('train_cfg', {}),
-            resume='allow',
-            id=wandb_cfg.get('run_id', None),
-        )
-        # Overwrite run_id so every worker subprocess resumes into this run.
-        wandb_cfg = dict(wandb_cfg)
-        wandb_cfg['run_id'] = _eval_run.id
-        _wandb.finish()   # close the main-process handle; workers will resume
-
     # evaluate several checkpoints in parallel
     # NOTE: in multi-task settings, each task is evaluated serially, which makes everything slow!
     split_n = utils.split_list(num_weights_to_eval, eval_cfg.framework.eval_envs)
@@ -187,8 +172,7 @@ def eval_seed(train_cfg,
                               device_idx,
                               eval_cfg.framework.eval_save_metrics,
                               eval_cfg.cinematic_recorder,
-                              None),
-                        kwargs={'wandb_cfg': wandb_cfg})
+                              None))
             p.start()
             processes.append(p)        
             
@@ -255,6 +239,10 @@ def main(eval_cfg: DictConfig) -> None:
     if eval_cfg.cinematic_recorder.enabled:
         obs_config.record_gripper_closing = True
 
+    # Always use the training episode_length so the time-in-state encoding
+    # seen at eval matches exactly what the model was trained on.
+    episode_length = train_cfg.rlbench.episode_length
+
     # single-task or multi-task
     if len(eval_cfg.rlbench.tasks) > 1:
         tasks = eval_cfg.rlbench.tasks
@@ -270,7 +258,7 @@ def main(eval_cfg: DictConfig) -> None:
                       obs_config,
                       action_mode,
                       eval_cfg.rlbench.demo_path,
-                      eval_cfg.rlbench.episode_length,
+                      episode_length,
                       eval_cfg.rlbench.headless,
                       eval_cfg.framework.eval_episodes,
                       train_cfg.rlbench.include_lang_goal_in_obs,
@@ -288,40 +276,13 @@ def main(eval_cfg: DictConfig) -> None:
                       obs_config,
                       action_mode,
                       eval_cfg.rlbench.demo_path,
-                      eval_cfg.rlbench.episode_length,
+                      episode_length,
                       eval_cfg.rlbench.headless,
                       train_cfg.rlbench.include_lang_goal_in_obs,
                       eval_cfg.rlbench.time_in_state,
                       eval_cfg.framework.record_every_n)
 
     logging.info('Evaluating seed %d.' % start_seed)
-
-    # ---- Build W&B config (mirrors the training run so metrics land in the same project) ----
-    # train_cfg is a struct DictConfig after set_struct(True) above, so convert
-    # to a plain dict before calling .get() to avoid OmegaConf struct errors.
-    _fw = OmegaConf.to_container(train_cfg.framework, resolve=True)
-    wandb_cfg = None
-    if _fw.get('use_wandb', False):
-        # Try to resume into the same W&B run as training by reading the
-        # persisted run id (written by OfflineTrainRunner on rank 0).
-        _run_id_file = os.path.join(logdir, 'wandb_run_id.txt')
-        _run_id = None
-        if os.path.exists(_run_id_file):
-            with open(_run_id_file) as _f:
-                _run_id = _f.read().strip() or None
-        wandb_cfg = {
-            'use_wandb': True,
-            'project':   _fw.get('wandb_project', 'manigaussian'),
-            # Use the same group as training so eval metrics appear alongside
-            # training curves in W&B.
-            'group':     _fw.get('wandb_group', 'eval'),
-            'name':      f"eval_seed{start_seed}",
-            # eval_seed() will init W&B in the main process and overwrite
-            # run_id for all workers, so all parallel workers log into the
-            # same run regardless of eval_envs count.
-            'run_id':    _run_id,
-            'train_cfg': _fw,
-        }
 
     eval_seed(train_cfg,
               eval_cfg,
@@ -330,8 +291,7 @@ def main(eval_cfg: DictConfig) -> None:
               env_device,
               device_idx,
               multi_task, start_seed,
-              env_config,
-              wandb_cfg=wandb_cfg)
+              env_config)
 
 if __name__ == '__main__':
     main()

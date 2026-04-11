@@ -260,35 +260,37 @@ class GeneralizableGSEmbedNet(nn.Module):
         if self.use_dynamic_field: #and data['step'] >= self.warm_up:
 
             if not self.use_semantic_feature:
-                # dyna_input: (d_latent, d_in)
+                # dyna_input: (SB*N, d_latent+d_in)
+                # point_latent / z_feature are already (SB*N, C); reshape maps to match
                 dyna_input = torch.cat((
-                    point_latent,   # [N, 128]
-                    data['xyz_maps'].detach().reshape(N, 3), 
-                    features_dc_maps.detach().reshape(N, 3),
-                    features_rest_maps.detach().reshape(N, 9),
-                    data['rot_maps'].detach().reshape(N, 4),
-                    data['scale_maps'].detach().reshape(N, 3),
-                    data['opacity_maps'].detach().reshape(N, 1),
+                    point_latent,   # [SB*N, 128]
+                    data['xyz_maps'].detach().reshape(-1, 3),
+                    features_dc_maps.detach().reshape(-1, 3),
+                    features_rest_maps.detach().reshape(-1, 9),
+                    data['rot_maps'].detach().reshape(-1, 4),
+                    data['scale_maps'].detach().reshape(-1, 3),
+                    data['opacity_maps'].detach().reshape(-1, 1),
                     # d_in:
                     z_feature,
                 ), dim=-1) # no batch dim
             else:
                 dyna_input = torch.cat((
-                    point_latent,   # [N, 128]
-                    data['xyz_maps'].detach().reshape(N, 3), 
-                    features_dc_maps.detach().reshape(N, 3),
-                    features_rest_maps.detach().reshape(N, 9),
-                    data['rot_maps'].detach().reshape(N, 4),
-                    data['scale_maps'].detach().reshape(N, 3),
-                    data['opacity_maps'].detach().reshape(N, 1),
-                    data['feature_maps'].detach().reshape(N, 3),
+                    point_latent,   # [SB*N, 128]
+                    data['xyz_maps'].detach().reshape(-1, 3),
+                    features_dc_maps.detach().reshape(-1, 3),
+                    features_rest_maps.detach().reshape(-1, 9),
+                    data['rot_maps'].detach().reshape(-1, 4),
+                    data['scale_maps'].detach().reshape(-1, 3),
+                    data['opacity_maps'].detach().reshape(-1, 1),
+                    data['feature_maps'].detach().reshape(-1, 3),
                     # d_in:
-                    z_feature,  
+                    z_feature,
                 ), dim=-1) # no batch dim
 
             # voxel embedding, stop gradient (gaussian xyz), (128+39)+3=170
             if self.use_action:
-                dyna_input = torch.cat((dyna_input, data['action'].repeat(N, 1)), dim=-1)   # action detach
+                # action is [SB, action_dim]; tile to match (SB*N) rows
+                dyna_input = torch.cat((dyna_input, data['action'].repeat_interleave(N, dim=0)), dim=-1)   # action detach
 
             next_split_network_outputs, _ = self.gs_deformation_field(
                 dyna_input,

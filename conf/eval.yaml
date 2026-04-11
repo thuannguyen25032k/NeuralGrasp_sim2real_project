@@ -8,9 +8,13 @@ method:
 rlbench:
     task_name: "multi"
     # change the task as you want. in our paper, we select these 10 tasks.
-    tasks: [close_jar,open_drawer,sweep_to_dustpan_of_size,meat_off_grill,turn_tap,slide_block_to_color_target,put_item_in_drawer,reach_and_drag,push_buttons,stack_blocks]
+    tasks: [light_bulb_in,put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,place_shape_in_shape_sorter,push_buttons,insert_onto_square_peg,stack_cups,place_cups]
     demo_path: /my/demo/path
-    episode_length: 25   # must match training config (conf/config.yaml rlbench.episode_length)
+    # NOTE: episode_length here is IGNORED by eval.py — it always reads
+    # train_cfg.rlbench.episode_length from the saved config.yaml so the
+    # time-in-state encoding seen at eval exactly matches training.
+    # This value is kept only as a human-readable reminder.
+    episode_length: 15   # for reference only; eval.py uses train_cfg value
     cameras: [front]
     camera_resolution: [128, 128]
     scene_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
@@ -51,19 +55,6 @@ cinematic_recorder:
     rotate_speed: 0.01
     # rotate_speed: 0 # NOTE: this is not front view
     save_path: ${framework.logdir}/${rlbench.task_name}/videos/
-
-# ---------------------------------------------------------------------------
-# Replay / loader settings (ManiFlow_BC only).
-# Eval never constructs a DataLoader, but these values are forwarded to
-# eval_seed() so they can be read from eval_cfg when train_cfg is unavailable
-# (e.g. ablation scripts).  Keep in sync with conf/config.yaml.
-# ---------------------------------------------------------------------------
-replay:
-    use_zarr_loader: False          # not used at eval time; present for config parity
-    zarr_path: 'data/train_zarr/train.zarr'
-    zarr_num_workers: 4
-    zarr_mem_gb: 8.0
-    zarr_copies: 10
 
 hydra:
     run:

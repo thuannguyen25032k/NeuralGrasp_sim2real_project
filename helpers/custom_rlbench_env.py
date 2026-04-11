@@ -83,10 +83,13 @@ class CustomRLBenchEnv(RLBenchEnv):
                 [obs_dict['low_dim_state'], [time]]).astype(np.float32)
 
         obs.gripper_matrix = grip_mat
-        # obs.gripper_pose = grip_pose
         obs.joint_positions = joint_pos
         obs.gripper_pose = grip_pose
-        # obs_dict['gripper_pose'] = grip_pose
+        # Expose the current gripper pose under the same key used by
+        # launch_utils.py / _add_keypoints_to_replay ('obs_gripper_pose')
+        # so that ManiFlowBCAgent.act() can pass it to encode_scene() as
+        # gripper_pose=, keeping train/eval behaviour consistent.
+        obs_dict['obs_gripper_pose'] = grip_pose.astype(np.float32)
         return obs_dict
 
     def set_variation(self, variation_number):
@@ -270,10 +273,13 @@ class CustomMultiTaskRLBenchEnv(MultiTaskRLBenchEnv):
                 [obs_dict['low_dim_state'], [time]]).astype(np.float32)
 
         obs.gripper_matrix = grip_mat
-        # obs.gripper_pose = grip_pose
         obs.joint_positions = joint_pos
         obs.gripper_pose = grip_pose
-        # obs_dict['gripper_pose'] = grip_pose
+        # Expose the current gripper pose under the same key used by
+        # launch_utils.py / _add_keypoints_to_replay ('obs_gripper_pose')
+        # so that ManiFlowBCAgent.act() can pass it to encode_scene() as
+        # gripper_pose=, keeping train/eval behaviour consistent.
+        obs_dict['obs_gripper_pose'] = grip_pose.astype(np.float32)
         return obs_dict
 
     def launch(self):

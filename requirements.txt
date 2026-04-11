@@ -22,3 +22,4 @@ zarr
 diffusers
 kornia
 open3d
+av==13.0.0  # PyAV — required by torchvision.io.write_video; >=14 breaks pict_type setter (needs int enum, not string)

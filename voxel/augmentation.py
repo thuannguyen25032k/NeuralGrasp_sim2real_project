@@ -89,7 +89,7 @@ def perturb_se3_camera_pose(camera_pose,
 
     perturbed_camera_pose = []
     for cam_pose in camera_pose:
-        
+        cam_pose = cam_pose.clone()   # avoid mutating the replay-buffer tensor in-place
         cam_R, cam_T = cam_pose[:, :3, :3], cam_pose[:, :3, 3:]
 
         # action_trans_3x1 = action_gripper_4x4[:, 0:3, 3].unsqueeze(-1).repeat(bs, 1, 1)
@@ -386,7 +386,8 @@ def apply_se3_augmentation_continuous(
         layer,
         trans_aug_range,
         rot_aug_range,
-        device):
+        device,
+        obs_gripper_pose=None):
     """
     SE3 augmentation for continuous-action agents (e.g. ManiFlow BC).
 
@@ -397,6 +398,10 @@ def apply_se3_augmentation_continuous(
         [x, y, z, qx, qy, qz, qw, gripper_open].
       - Keeps the point-cloud and camera-pose perturbation identical to
         the original function (needed by the Gaussian-Splatting renderer).
+      - Optionally transforms obs_gripper_pose (current obs gripper pose,
+        which is passed to encode_scene for gripper_context_head) into the
+        same augmented world frame as pcd, so scene tokens and the gripper
+        context are expressed in a consistent coordinate system.
 
     Parameters
     ----------
@@ -412,12 +417,18 @@ def apply_se3_augmentation_continuous(
     rot_aug_range     : list [roll_deg, pitch_deg, yaw_deg] max rotation
                         Sampled continuously (uniform) — no discretization.
     device            : torch device
+    obs_gripper_pose  : (B, 7) or None — current observation gripper pose
+                        [xyz, qx, qy, qz, qw].  When provided it is transformed
+                        by the same SE3 as pcd and returned as the 4th element.
+                        This keeps the gripper_context_head's position token
+                        consistent with the augmented scene tokens.
 
     Returns
     -------
-    action_gt_aug  : (B, 8) augmented continuous action (same dtype as input)
-    pcd_aug        : list of perturbed point clouds
-    camera_pose_aug: list of perturbed camera extrinsics
+    action_gt_aug       : (B, 8) augmented continuous action (same dtype as input)
+    pcd_aug             : list of perturbed point clouds
+    camera_pose_aug     : list of perturbed camera extrinsics
+    obs_gripper_pose_aug: (B, 7) augmented obs gripper pose, or None if not provided
     """
     bs = pcd[0].shape[0]
     identity_4x4 = torch.eye(4).unsqueeze(0).repeat(bs, 1, 1).to(device=device)
@@ -516,7 +527,39 @@ def apply_se3_augmentation_continuous(
     pcd_aug         = perturb_se3(pcd, trans_shift_4x4, rot_shift_4x4, action_gripper_4x4, bounds)
     camera_pose_aug = perturb_se3_camera_pose(camera_pose, trans_shift_4x4, rot_shift_4x4, action_gripper_4x4, bounds)
 
-    return action_gt_aug, pcd_aug, camera_pose_aug
+    # ---- Optionally transform obs_gripper_pose into the augmented frame ----
+    # After SE3 augmentation the pcd (and thus the scene tokens produced by
+    # encode_scene) are in the *augmented* world frame.  obs_gripper_pose is
+    # passed to encode_scene → gripper_context_head, which uses its xyz as a
+    # world-space 3D position.  If we left obs_gripper_pose in the original
+    # frame, the gripper position token would be inconsistent with the scene
+    # tokens — the same mismatch that motivated fixing action_gt above.
+    #
+    # The transformation is identical to what we did for action_gt:
+    #   aug_pos = R_delta^T * (t_obs_grip - t_pivot) + clamp(t_pivot + t_shift)
+    #   aug_rot = R_delta^T * R_obs_grip
+    obs_gripper_pose_aug = None
+    if obs_gripper_pose is not None:
+        obs_grip_quat_xyzw = obs_gripper_pose[:, 3:7]                         # (B, 4) xyzw
+        obs_grip_quat_wxyz = torch.cat(
+            [obs_grip_quat_xyzw[:, 3:4], obs_grip_quat_xyzw[:, :3]], dim=1
+        )                                                                       # (B, 4) wxyz
+        obs_grip_rot = torch3d_tf.quaternion_to_matrix(obs_grip_quat_wxyz)     # (B, 3, 3)
+
+        t_obs_grip = obs_gripper_pose[:, :3]                                   # (B, 3)
+        obs_offset = t_obs_grip - t_pivot                                      # (B, 3)
+        aug_obs_offset = torch.einsum('bij,bj->bi', rot_shift_3x3_T, obs_offset)  # (B, 3)
+        aug_obs_pos = aug_obs_offset + new_pivot                               # (B, 3)
+
+        aug_obs_rot = torch.bmm(rot_shift_3x3_T, obs_grip_rot)                 # (B, 3, 3)
+        aug_obs_quat_wxyz = torch3d_tf.matrix_to_quaternion(aug_obs_rot)       # (B, 4) wxyz
+        aug_obs_quat_xyzw = torch.cat(
+            [aug_obs_quat_wxyz[:, 1:], aug_obs_quat_wxyz[:, 0:1]], dim=1
+        )                                                                       # (B, 4) xyzw
+
+        obs_gripper_pose_aug = torch.cat([aug_obs_pos, aug_obs_quat_xyzw], dim=-1)  # (B, 7)
+
+    return action_gt_aug, pcd_aug, camera_pose_aug, obs_gripper_pose_aug
 
 
 ### ref: https://github.com/vlc-robot/polarnet

@@ -4,6 +4,98 @@ import torch.autograd.profiler as profiler
 import visdom
 import time
 
+# ---------------------------------------------------------------------------
+# 6D rotation representation utilities
+# (Zhou et al., "On the Continuity of Rotation Representations in Neural
+#  Networks", CVPR 2019)
+# ---------------------------------------------------------------------------
+
+def normalise_quat(x: torch.Tensor) -> torch.Tensor:
+    """Normalise a quaternion tensor along its last dimension."""
+    return x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+
+
+def quat_xyzw_to_matrix(quat: torch.Tensor) -> torch.Tensor:
+    """Convert xyzw quaternion (..., 4) to rotation matrix (..., 3, 3)."""
+    quat = normalise_quat(quat)
+    x, y, z, w = quat.unbind(-1)
+    B = quat.shape[:-1]
+    mat = torch.stack([
+        1 - 2*(y*y + z*z),   2*(x*y - w*z),       2*(x*z + w*y),
+        2*(x*y + w*z),        1 - 2*(x*x + z*z),   2*(y*z - w*x),
+        2*(x*z - w*y),        2*(y*z + w*x),        1 - 2*(x*x + y*y),
+    ], dim=-1).reshape(*B, 3, 3)
+    return mat
+
+
+def matrix_to_ortho6d(matrix: torch.Tensor) -> torch.Tensor:
+    """Extract the first two columns of a rotation matrix as 6D rep (..., 6)."""
+    # matrix: (..., 3, 3)
+    return torch.cat([matrix[..., 0], matrix[..., 1]], dim=-1)   # (..., 6)
+
+
+def ortho6d_to_matrix(ortho6d: torch.Tensor) -> torch.Tensor:
+    """Gram-Schmidt: 6D rep (..., 6) → rotation matrix (..., 3, 3)."""
+    a1 = ortho6d[..., :3]
+    a2 = ortho6d[..., 3:6]
+    b1 = a1 / (a1.norm(dim=-1, keepdim=True) + 1e-8)
+    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = b2 / (b2.norm(dim=-1, keepdim=True) + 1e-8)
+    b3 = torch.linalg.cross(b1, b2)
+    return torch.stack([b1, b2, b3], dim=-1)           # (..., 3, 3)
+
+
+def matrix_to_quat_xyzw(matrix: torch.Tensor) -> torch.Tensor:
+    """Rotation matrix (..., 3, 3) → xyzw quaternion (..., 4)."""
+    # Shepperd method
+    m = matrix
+    trace = m[..., 0, 0] + m[..., 1, 1] + m[..., 2, 2]
+    quats = torch.zeros(*matrix.shape[:-2], 4, device=matrix.device,
+                        dtype=matrix.dtype)
+    # Case: trace > 0
+    s     = torch.sqrt(torch.clamp(trace + 1.0, min=1e-10)) * 2   # 4w
+    quats[..., 0] = (m[..., 2, 1] - m[..., 1, 2]) / s   # x
+    quats[..., 1] = (m[..., 0, 2] - m[..., 2, 0]) / s   # y
+    quats[..., 2] = (m[..., 1, 0] - m[..., 0, 1]) / s   # z
+    quats[..., 3] = 0.25 * s                              # w
+
+    # Case: m00 largest diagonal — use a more numerically stable path
+    cond1 = (m[..., 0, 0] > m[..., 1, 1]) & (m[..., 0, 0] > m[..., 2, 2]) & (trace <= 0)
+    s1    = torch.sqrt(torch.clamp(1.0 + m[..., 0, 0] - m[..., 1, 1] - m[..., 2, 2], min=1e-10)) * 2
+    q1    = torch.stack([0.25 * s1,
+                         (m[..., 0, 1] + m[..., 1, 0]) / s1,
+                         (m[..., 0, 2] + m[..., 2, 0]) / s1,
+                         (m[..., 2, 1] - m[..., 1, 2]) / s1], dim=-1)
+    quats = torch.where(cond1.unsqueeze(-1), q1, quats)
+
+    cond2 = (m[..., 1, 1] > m[..., 2, 2]) & ~cond1 & (trace <= 0)
+    s2    = torch.sqrt(torch.clamp(1.0 + m[..., 1, 1] - m[..., 0, 0] - m[..., 2, 2], min=1e-10)) * 2
+    q2    = torch.stack([(m[..., 0, 1] + m[..., 1, 0]) / s2,
+                         0.25 * s2,
+                         (m[..., 1, 2] + m[..., 2, 1]) / s2,
+                         (m[..., 0, 2] - m[..., 2, 0]) / s2], dim=-1)
+    quats = torch.where(cond2.unsqueeze(-1), q2, quats)
+
+    cond3 = ~cond1 & ~cond2 & (trace <= 0)
+    s3    = torch.sqrt(torch.clamp(1.0 + m[..., 2, 2] - m[..., 0, 0] - m[..., 1, 1], min=1e-10)) * 2
+    q3    = torch.stack([(m[..., 0, 2] + m[..., 2, 0]) / s3,
+                         (m[..., 1, 2] + m[..., 2, 1]) / s3,
+                         0.25 * s3,
+                         (m[..., 1, 0] - m[..., 0, 1]) / s3], dim=-1)
+    quats = torch.where(cond3.unsqueeze(-1), q3, quats)
+
+    return normalise_quat(quats)    # (..., 4)  xyzw
+
+
+def quat_xyzw_to_ortho6d(quat: torch.Tensor) -> torch.Tensor:
+    """xyzw quaternion (..., 4) → 6D rotation rep (..., 6). Used in training."""
+    return matrix_to_ortho6d(quat_xyzw_to_matrix(quat))
+
+
+def ortho6d_to_quat_xyzw(ortho6d: torch.Tensor) -> torch.Tensor:
+    """6D rotation rep (..., 6) → xyzw quaternion (..., 4). Used at inference."""
+    return matrix_to_quat_xyzw(ortho6d_to_matrix(ortho6d))
+
 
 @torch.no_grad()
 def visualize_pcd(xyz, attention_coordinate=None, rgb=None, name='xyz', sleep=0):

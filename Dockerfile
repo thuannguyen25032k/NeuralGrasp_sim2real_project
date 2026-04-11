@@ -108,8 +108,22 @@ RUN uv pip install --no-cache-dir --no-build-isolation -r /app/third_party/PyRep
 RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/PyRep
 RUN uv pip install --no-cache-dir --no-build-isolation -r /app/third_party/RLBench/requirements.txt
 RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/RLBench
+
+# Install Lightning Fabric BEFORE YARR so YARR's offline_train_runner.py
+# (which uses `from lightning_fabric import Fabric`) installs against the
+# correct package.  Installing YARR first would bake the old
+# `from lightning.fabric import Fabric` (lightning>=2.x) into site-packages.
+# NOTE: Do not install `lightning==2.x` here; it conflicts with the legacy
+# `pytorch-lightning` API used by repo deps (e.g. `pytorch_lightning.metrics`).
+RUN uv pip install --no-cache-dir --no-build-isolation "lightning-fabric==1.9.5"
+
+# Now install YARR — its offline_train_runner uses `from lightning_fabric import Fabric`
+# which resolves correctly against the package installed above.
+# Re-pin hydra-core/omegaconf afterwards because YARR's requirements.txt
+# pulls in older versions.
 RUN uv pip install --no-cache-dir --no-build-isolation -r /app/third_party/YARR/requirements.txt
 RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/YARR
+RUN uv pip install --no-cache-dir 'hydra-core==1.1' 'omegaconf==2.1.2'
 
 # Fix some possible problems
 RUN uv pip install --no-cache-dir opencv-python-headless
@@ -119,11 +133,6 @@ RUN uv pip install --no-cache-dir "numpy==1.23.5"
 RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/gaussian-splatting/submodules/diff-gaussian-rasterization
 RUN uv pip install --no-cache-dir --no-build-isolation /app/third_party/gaussian-splatting/submodules/simple-knn
 
-# Install Lightning Fabric
-# NOTE: Do not install `lightning==2.x` here; it can conflict with the legacy `pytorch-lightning` API
-# used by repo dependencies (e.g. `pytorch_lightning.metrics`).
-# RUN uv pip install --no-cache-dir --no-build-isolation lightning==2.0.9.post0
-RUN uv pip install --no-cache-dir --no-build-isolation "lightning-fabric==1.9.5"
 RUN uv pip install --no-cache-dir --no-build-isolation transformers==4.30.2
 RUN uv pip install --no-cache-dir --no-build-isolation wandb==0.13.1
 RUN uv pip install --no-cache-dir --no-build-isolation hydra-core==1.1

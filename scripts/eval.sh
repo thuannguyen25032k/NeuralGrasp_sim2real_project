@@ -17,7 +17,7 @@ eval_gpu=${3:-"0"}
 cur_dir=$(pwd)
 train_demo_path="${cur_dir}/data/train_data"
 test_demo_path="${cur_dir}/data/test_data"
-
+tasks="[put_money_in_safe]"   # specify the task(s) to evaluate on; e.g. "[put_money_in_safe,place_cups]" or "all" for all tasks in the demo path
 use_split='test'    # or 'train' for debugging
 
 starttime=`date +'%Y-%m-%d %H:%M:%S'`
@@ -28,9 +28,10 @@ if [ "${use_split}" == "train" ]; then
     CUDA_VISIBLE_DEVICES=${eval_gpu} xvfb-run -a python eval.py \
         method.name=${method_name} \
         rlbench.task_name=${exp_name} \
+        rlbench.tasks=${tasks} \
         rlbench.demo_path=${train_demo_path} \
         framework.start_seed=${seed} \
-        framework.eval_episodes=20
+        framework.eval_episodes=15
 
 else
     echo "eval on test set"
@@ -38,8 +39,10 @@ else
     CUDA_VISIBLE_DEVICES=${eval_gpu} xvfb-run -a python eval.py \
         method.name=${method_name} \
         rlbench.task_name=${exp_name} \
+        rlbench.tasks=${tasks} \
         rlbench.demo_path=${test_demo_path} \
-        framework.start_seed=${seed}
+        framework.start_seed=${seed} \
+        framework.eval_type=last
 fi
 
 endtime=`date +'%Y-%m-%d %H:%M:%S'`

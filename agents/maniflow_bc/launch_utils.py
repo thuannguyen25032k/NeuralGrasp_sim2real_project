@@ -1,195 +1,390 @@
 """
 ManiFlow launch utilities
 =========================
-Pure-Zarr data pipeline — no YARR replay buffer.
-
-Data flow
----------
-  convert_replay_to_zarr.py  →  {split}.zarr + instructions.json
-  create_zarr_loader()        →  PyTorch DataLoader (ManiFlowZarrDataset)
-  OfflineTrainRunner          →  calls agent.update(batch) each step
-
-Batch keys produced by maniflow_collate_fn (mirrors base_collate_fn):
-  task          list[str]           length B
-  instr         list[str]           length B
-  rgb           (B, ncam, 3, H, W)   float32
-  pcd           (B, ncam, 3, H, W)   float32
-  proprioception (B, nhist, nhand, 8) float32
-  action        (B, 8)               float32  [xyz qxyzw grip]  (nhand+T squeezed)
-  extrinsics    (B, ncam, 4, 4)      float32
-  intrinsics    (B, ncam, 3, 3)      float32
-  nerf_multi_view_rgb/depth/camera      (B, nview)  object (optional)
-  nerf_next_multi_view_rgb/depth/camera (B, nview)  object (optional)
+Mirrors agents/manigaussian_bc/launch_utils.py but:
+  - Builds a VoxelFlowEncoder instead of PerceiverVoxelLangEncoder.
+  - Wraps it in ManiFlowBCAgent / ManiFlowStackAgent.
+  - Keeps the replay buffer definition identical (same observation/action
+    elements) so existing data pipelines work unchanged.
+  - The continuous action stored in the replay is the 8-DoF gripper pose:
+    [x, y, z, qx, qy, qz, qw, gripper_open].
 """
 
-import json
 import logging
 import random
-from typing import List, Optional
+from typing import List
 
 import numpy as np
+from rlbench.backend.observation import Observation
+from rlbench.observation_config import ObservationConfig
+import rlbench.utils as rlbench_utils
+from rlbench.demo import Demo
 
-from agents.maniflow_bc.preprocess_agent import ManiFlowPreprocessAgent
+from yarr.replay_buffer.prioritized_replay_buffer import ObservationElement
+from yarr.replay_buffer.replay_buffer import ReplayElement, ReplayBuffer
+from yarr.replay_buffer.task_uniform_replay_buffer import TaskUniformReplayBuffer
+from yarr.replay_buffer.uniform_replay_buffer_single_process import UniformReplayBufferSingleProcess
+
+from helpers import demo_loading_utils, utils
+from helpers.preprocess_agent import PreprocessAgent
+from helpers.clip.core.clip import tokenize
+from helpers.language_model import create_language_model
+
 from agents.maniflow_bc.voxel_flow_encoder import VoxelFlowEncoder
 from agents.maniflow_bc.qattention_maniflow_agent import ManiFlowBCAgent
 from agents.maniflow_bc.qattention_stack_agent import ManiFlowStackAgent
-from agents.maniflow_bc.zarr_dataset import ManiFlowZarrDataset, maniflow_collate_fn
-from agents.maniflow_bc.gpu_preprocessor import ManiFlowGPUPreprocessor
 
 import torch
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from torch.multiprocessing import Process, Value, Manager
 from omegaconf import DictConfig
 from termcolor import cprint
 from lightning_fabric import Fabric
 
 
-# ---------------------------------------------------------------------------
-# Module-level worker init — must be at module scope so it is picklable
-# by the DataLoader multiprocessing backend.
-# ---------------------------------------------------------------------------
-
-def _seed_worker(worker_id: int):
-    """Seed numpy/random per worker for reproducible augmentation."""
-    import random as _random
-    worker_seed = torch.initial_seed() % 2 ** 32
-    np.random.seed(worker_seed)
-    _random.seed(worker_seed)
+REWARD_SCALE = 100.0
+LOW_DIM_SIZE = 4
 
 
 # ---------------------------------------------------------------------------
-# Fast Zarr-based DataLoader
+# Replay buffer
 # ---------------------------------------------------------------------------
 
-def create_zarr_loader(
-        zarr_path: str,
-        instructions_path: str,
-        batch_size: int,
-        cameras: List[str] = None,
-        camera_inds: Optional[List[int]] = None,
-        chunk_size: int = 1,
-        num_workers: int = 4,
-        mem_gb: float = 8.0,
-        relative_action: bool = False,
-        copies: int = 10,
-        distributed: bool = False,
-        rank: int = 0,
-        world_size: int = 1,
-        seed: int = 0,
-) -> tuple:
+def create_replay(batch_size: int, timesteps: int,
+                  prioritisation: bool, task_uniform: bool,
+                  save_dir: str, cameras: list,
+                  voxel_sizes,
+                  image_size=None,
+                  replay_size=3e5,
+                  single_process=False,
+                  cfg=None):
     """
-    Build a DataLoader backed by ``ManiFlowZarrDataset``.
-
-    Mirrors 3D FlowMatch Actor's ``get_loaders`` (utils/trainers/base.py):
-      - ``prefetch_factor=4``    → keep 4 batches pre-loaded in worker RAM
-      - ``persistent_workers``   → workers stay alive across epochs
-      - ``pin_memory=True``      → faster H→D transfer for CUDA tensors
-      - Seeded ``worker_init_fn``→ reproducible augmentation per worker
-      - ``DistributedSampler``   → proper data sharding in DDP runs
-
-    Parameters
-    ----------
-    zarr_path          : Path to ``{split}.zarr``.
-    instructions_path  : Path to ``instructions.json`` (task→variation→list[str]).
-    batch_size         : Batch size per GPU.
-    cameras            : Camera names (must match converter order).
-    chunk_size         : Action chunk size T (must match method.action_chunk_size).
-    num_workers        : DataLoader worker processes (default 4).
-    mem_gb             : LRU cache per worker process in GiB.
-    relative_action    : Return delta actions (SO(3) relative).
-    copies             : Virtual dataset length multiplier.
-    distributed        : Use DistributedSampler (for DDP).
-    rank / world_size  : DDP rank / world-size.
-    seed               : Global RNG seed for reproducibility.
-
-    Returns
-    -------
-    (loader, dataset, sampler)
+    Create a replay buffer with the same structure as manigaussian_bc so that
+    existing data-generation scripts work without modification.
     """
-    with open(instructions_path, 'r') as f:
-        instructions = json.load(f)
+    if image_size is None:
+        image_size = [128, 128]
 
-    dataset = ManiFlowZarrDataset(
-        zarr_path=zarr_path,
-        instructions=instructions,
-        cameras=cameras or ["front"],
-        camera_inds=camera_inds,
-        chunk_size=chunk_size,
-        mem_gb=mem_gb,
-        relative_action=relative_action,
-        copies=copies,
-    )
+    gripper_pose_size = 7
+    ignore_collisions_size = 1
+    max_token_seq_len = 77
+    lang_feat_dim = 1024
+    lang_emb_dim = cfg.method.language_model_dim
+    cprint(f"[create_replay] lang_emb_dim: {lang_emb_dim}", "green")
 
-    def _seed_worker_local(worker_id: int):  # kept as local for backward-compat; unused
-        pass
+    num_view_for_nerf = cfg.rlbench.num_view_for_nerf
 
-    g = torch.Generator()
-    g.manual_seed(seed)
+    observation_elements = []
+    observation_elements.append(
+        ObservationElement('low_dim_state', (LOW_DIM_SIZE,), np.float32))
 
-    if distributed:
-        sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank,
-            shuffle=True, drop_last=True,
+    for cname in cameras:
+        observation_elements.extend([
+            ObservationElement('%s_rgb' % cname,
+                               (3, *image_size,), np.float32),
+            ObservationElement('%s_depth' % cname,
+                               (1, *image_size,), np.float32),
+            ObservationElement('%s_point_cloud' %
+                               cname,  (3, *image_size),  np.float32),
+            ObservationElement('%s_camera_extrinsics' %
+                               cname, (4, 4,), np.float32),
+            ObservationElement('%s_camera_intrinsics' %
+                               cname, (3, 3,), np.float32),
+        ])
+
+    # NeRF multi-view observations
+    for prefix in ('nerf_multi_view', 'nerf_next_multi_view'):
+        observation_elements.extend([
+            ObservationElement(f'{prefix}_rgb',
+                               (num_view_for_nerf,), np.object_),
+            ObservationElement(f'{prefix}_depth',
+                               (num_view_for_nerf,), np.object_),
+            ObservationElement(f'{prefix}_camera',
+                               (num_view_for_nerf,), np.object_),
+        ])
+    observation_elements.extend([
+        ReplayElement('ignore_collisions',
+                      (ignore_collisions_size,),           np.float32),
+        ReplayElement('gripper_pose',
+                      (gripper_pose_size,),               np.float32),
+        ReplayElement('obs_gripper_pose',
+                      (gripper_pose_size,),               np.float32),   # current obs pose for scene encoder
+        ReplayElement('lang_goal_emb',       (lang_feat_dim,
+                                              ),                   np.float32),
+        ReplayElement('lang_token_embs',
+                      (max_token_seq_len, lang_emb_dim,), np.float32),
+        ReplayElement('task',  (), str),
+        ReplayElement('lang_goal', (1,), object),
+    ])
+
+    # flag to indicate whether this transition is from a demo (vs. generated by the agent's own policy) for analysis purposes; stored as bool
+    extra_replay_elements = [ReplayElement('demo', (), np.bool_)]
+
+    if not single_process:
+        replay_buffer = TaskUniformReplayBuffer(
+            save_dir=save_dir,
+            batch_size=batch_size,
+            timesteps=timesteps,
+            replay_capacity=int(replay_size),
+            action_shape=(8,),          # continuous 8-DoF
+            action_dtype=np.float32,
+            reward_shape=(),
+            reward_dtype=np.float32,
+            update_horizon=1,
+            observation_elements=observation_elements,
+            extra_replay_elements=extra_replay_elements,
         )
-        shuffle = False
     else:
-        sampler = None
-        shuffle = True
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle if sampler is None else False,
-        num_workers=num_workers,
-        worker_init_fn=_seed_worker,
-        collate_fn=maniflow_collate_fn,
-        pin_memory=True,
-        sampler=sampler,
-        drop_last=True,
-        generator=g,
-        prefetch_factor=4 if num_workers > 0 else None,
-        persistent_workers=num_workers > 0,
-    )
-    return loader, dataset, sampler
+        replay_buffer = UniformReplayBufferSingleProcess(
+            save_dir=save_dir,
+            batch_size=batch_size,
+            timesteps=timesteps,
+            replay_capacity=int(replay_size),
+            action_shape=(8,),
+            action_dtype=np.float32,
+            reward_shape=(),
+            reward_dtype=np.float32,
+            update_horizon=1,
+            observation_elements=observation_elements,
+            extra_replay_elements=extra_replay_elements,
+        )
+    return replay_buffer
 
 
 # ---------------------------------------------------------------------------
-# GPU Pre-processor factory
+# Internal helpers (identical to manigaussian_bc)
 # ---------------------------------------------------------------------------
 
-def create_gpu_preprocessor(
-        image_size: tuple = (128, 128),
-        augment_prob: float = 0.8,
-        crop_prob: float = 0.1,
-        custom_imsize: Optional[int] = None,
-) -> ManiFlowGPUPreprocessor:
+def _get_action(obs_tp1: Observation):
     """
-    Instantiate a ``ManiFlowGPUPreprocessor`` (GPU-side depth→PCD + kornia
-    augmentation).
+    Returns the continuous 8-DoF action for the flow-matching head:
+      [x, y, z, qx, qy, qz, qw, gripper_open]
 
-    The returned module should be moved to the training device:
-        preprocessor = create_gpu_preprocessor(...).to(device)
-
-    During training call:
-        rgb_proc, pcd_proc = preprocessor(rgb, depth, extrinsics, intrinsics,
-                                          augment=True)
-    During evaluation:
-        rgb_proc, pcd_proc = preprocessor(rgb, depth, extrinsics, intrinsics,
-                                          augment=False)
+    Matches the 3D FlowMatch Actor convention: quaternion is stored as-is
+    (only L2-normalised).  The ``normalise_quat`` call inside ``_convert_rot``
+    at training time handles any residual norm error; no sign-flip is applied
+    here so the full unit-sphere is exploited.
     """
-    return ManiFlowGPUPreprocessor(
-        image_size=image_size,
-        augment_prob=augment_prob,
-        crop_prob=crop_prob,
-        custom_imsize=custom_imsize,
+    quat = utils.normalize_quaternion(obs_tp1.gripper_pose[3:])  # L2-normalise only
+    grip = float(obs_tp1.gripper_open)
+    continuous_action = np.concatenate([
+        obs_tp1.gripper_pose[:3],   # xyz
+        quat,                       # qx, qy, qz, qw  (xyzw format)
+        np.array([grip])
+    ])
+    return continuous_action
+
+
+def _add_keypoints_to_replay(
+        cfg: DictConfig,
+        task: str,
+        replay: ReplayBuffer,
+        inital_obs: Observation,
+        demo: Demo,
+        episode_keypoints: List[int],
+        cameras: List[str],
+        description: str = '',
+        language_model=None,
+        device='cpu',
+        initial_frame_idx: int = 0):
+
+    prev_action = None
+    obs = inital_obs    # Initial observation is 0
+    obs_frame_idx = initial_frame_idx   # absolute frame index of the current `obs` in the demo
+
+    for k, keypoint in enumerate(episode_keypoints):    # demo[-1].nerf_multi_view_rgb is none 
+        obs_tp1 = demo[keypoint]
+        obs_tm1 = demo[max(0, keypoint - 1)]
+
+        action = _get_action(obs_tp1)
+        # Use ignore_collisions from the current starting obs (matches eval,
+        # which reads it from the live observation dict at act() time).
+        ignore_collisions = int(obs.ignore_collisions)
+
+        terminal = (k == len(episode_keypoints) - 1)
+        reward = float(terminal) * REWARD_SCALE if terminal else 0
+
+        # Use the absolute frame index of the *current* obs (demo[prev_keypoint])
+        # as the time token, not the sparse keypoint counter k.
+        # `obs` is updated to obs_tp1 at the end of this loop, so after the
+        # first iteration obs = demo[episode_keypoints[k-1]].
+        # We track the frame index explicitly via `obs_frame_idx`.
+        obs_dict = utils.extract_obs(
+            obs, t=obs_frame_idx, prev_action=prev_action,
+            cameras=cameras,
+            episode_length=cfg.rlbench.episode_length,
+            next_obs=obs_tp1 if not terminal else obs_tm1,
+        )
+        sentence_emb, token_embs = language_model.extract(description)
+        obs_dict['lang_goal_emb'] = sentence_emb[0].float(
+        ).detach().cpu().numpy()
+        obs_dict['lang_token_embs'] = token_embs[0].float(
+        ).detach().cpu().numpy()
+        obs_dict['lang_goal'] = np.array([description], dtype=object)
+
+        prev_action = np.copy(action)
+
+        others = {'demo': True}
+        final_obs = {
+            'gripper_pose':      obs_tp1.gripper_pose,   # target pose (action GT)
+            'obs_gripper_pose':  obs.gripper_pose,        # current obs pose (for scene encoder)
+            'task':              task,
+            'lang_goal':         np.array([description], dtype=object),
+        }
+        others.update(obs_dict)
+        others.update(final_obs)
+
+        timeout = False
+        replay.add(action, reward, terminal, timeout, **others)
+        obs = obs_tp1
+        obs_frame_idx = keypoint   # advance to absolute frame index of new obs
+
+    # Final step: obs is now demo[last_keypoint]; use its frame index
+    obs_dict_tp1 = utils.extract_obs(
+        obs_tp1, t=keypoint, prev_action=prev_action,
+        cameras=cameras,
+        episode_length=cfg.rlbench.episode_length,
+        next_obs=obs_tp1,
     )
+    obs_dict_tp1['lang_goal_emb'] = sentence_emb[0].float(
+    ).detach().cpu().numpy()
+    obs_dict_tp1['lang_token_embs'] = token_embs[0].float(
+    ).detach().cpu().numpy()
+    obs_dict_tp1['lang_goal'] = np.array([description], dtype=object)
+    obs_dict_tp1.pop('wrist_world_to_cam', None)
+    obs_dict_tp1.update(final_obs)
+    # For the terminal state obs_tp1 IS the current obs, so its own gripper
+    # pose is the correct 'obs_gripper_pose' (not the previous obs's pose
+    # that was captured in final_obs before 'obs = obs_tp1' at end of loop).
+    obs_dict_tp1['obs_gripper_pose'] = obs_tp1.gripper_pose
+    replay.add_final(**obs_dict_tp1)
+
+
+# ---------------------------------------------------------------------------
+# fill_replay / fill_multi_task_replay (unchanged logic, just name-updated)
+# ---------------------------------------------------------------------------
+
+def fill_replay(cfg: DictConfig,
+                obs_config: ObservationConfig,
+                rank: int,
+                replay: ReplayBuffer,
+                task: str,
+                num_demos: int,
+                demo_augmentation: bool,
+                demo_augmentation_every_n: int,
+                cameras: List[str],
+                language_model=None,
+                device='cpu',
+                keypoint_method='heuristic'):
+    # Create the language model inside the worker process so it is
+    # constructed directly on the target device.  Passing a CUDA-backed
+    # model from the parent process causes fp16 weights to silently land
+    # on CPU inside the child, triggering "addmm_impl_cpu_ not implemented
+    # for Half".
+    language_model = create_language_model(
+        name=cfg.method.language_model, device=device
+    )
+
+    logging.getLogger().setLevel(cfg.framework.logging_level)
+    logging.debug('Filling %s replay ...' % task)
+
+    for d_idx in range(num_demos):
+        demo = rlbench_utils.get_stored_demos(
+            amount=1, image_paths=False,
+            dataset_root=cfg.rlbench.demo_path,
+            variation_number=-1, task_name=task,
+            obs_config=obs_config,
+            random_selection=False,
+            from_episode_number=d_idx,
+        )[0]
+
+        descs = demo._observations[0].misc['descriptions']
+        episode_keypoints = demo_loading_utils.keypoint_discovery(
+            demo, method=keypoint_method
+        )
+
+        if rank == 0:
+            logging.info(
+                f"Loading Demo({d_idx}) - found {len(episode_keypoints)} "
+                f"keypoints - {task}"
+            )
+
+        for i in range(len(demo) - 1):
+            if not demo_augmentation and i > 0:
+                break
+            if i % demo_augmentation_every_n != 0:
+                continue
+            obs = demo[i]
+            desc = descs[0]
+
+            while len(episode_keypoints) > 0 and i >= episode_keypoints[0]:
+                episode_keypoints = episode_keypoints[1:]
+            if len(episode_keypoints) == 0:
+                break
+
+            _add_keypoints_to_replay(
+                cfg, task, replay, obs, demo, episode_keypoints, cameras,
+                description=desc,
+                language_model=language_model,
+                device=device,
+                initial_frame_idx=i,
+            )
+
+    logging.debug('Replay %s filled with demos.' % task)
+
+
+def fill_multi_task_replay(cfg: DictConfig,
+                           obs_config: ObservationConfig,
+                           rank: int,
+                           replay: ReplayBuffer,
+                           tasks: List[str],
+                           num_demos: int,
+                           demo_augmentation: bool,
+                           demo_augmentation_every_n: int,
+                           cameras: List[str],
+                           keypoint_method: str = 'heuristic',
+                           fabric: Fabric = None):
+
+    manager = Manager()
+    store = manager.dict()
+
+    if hasattr(replay, '_task_idxs'):
+        del replay._task_idxs
+    task_idxs = manager.dict()
+    replay._task_idxs = task_idxs
+    replay._create_storage(store)
+    replay.add_count = Value('i', 0)
+
+    max_parallel_processes = cfg.replay.max_parallel_processes
+    processes = []
+    n = np.arange(len(tasks))
+    split_n = utils.split_list(n, max_parallel_processes)
+
+    for split in split_n:
+        for e_idx, task_idx in enumerate(split):
+            task = tasks[int(task_idx)]
+            model_device = torch.device(
+                'cuda:%s' % (e_idx % torch.cuda.device_count())
+                if torch.cuda.is_available() else 'cpu'
+            )
+            p = Process(
+                target=fill_replay,
+                args=(cfg, obs_config, rank, replay, task, num_demos,
+                      demo_augmentation, demo_augmentation_every_n,
+                      cameras, None, model_device,
+                      keypoint_method),
+            )
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
 
 
 # ---------------------------------------------------------------------------
 # create_agent
 # ---------------------------------------------------------------------------
 
-def create_agent(cfg: DictConfig) -> ManiFlowPreprocessAgent:
+def create_agent(cfg: DictConfig) -> PreprocessAgent:
     """
     Build the ManiFlow agent stack from config.
 
@@ -226,6 +421,8 @@ def create_agent(cfg: DictConfig) -> ManiFlowPreprocessAgent:
     lv2_batch_size = getattr(cfg.method, 'lv2_batch_size', 1)
     workspace_bounds = list(getattr(cfg.method, 'workspace_bounds',
                                     list(depth_0bounds)))
+    use_clip_backbone = getattr(cfg.method, 'use_clip_backbone', False)
+    finetune_clip_backbone = getattr(cfg.method, 'finetune_clip_backbone', False)
     # Legacy stubs (ignored by new VoxelFlowEncoder but kept for YAML compat)
     flow_context_dim = getattr(cfg.method, 'flow_context_dim',  256)
     flow_hidden_dim = getattr(cfg.method, 'flow_hidden_dim',   512)
@@ -251,6 +448,8 @@ def create_agent(cfg: DictConfig) -> ManiFlowPreprocessAgent:
             denoise_timesteps=denoise_timesteps,
             activation=cfg.method.activation,
             lang_fusion_type=cfg.method.lang_fusion_type,
+            use_clip_backbone=use_clip_backbone,
+            finetune_clip_backbone=finetune_clip_backbone,
             # legacy stubs
             context_dim=flow_context_dim,
             flow_hidden_dim=flow_hidden_dim,
@@ -300,8 +499,5 @@ def create_agent(cfg: DictConfig) -> ManiFlowPreprocessAgent:
         qattention_agents=qattention_agents,
         camera_names=cfg.rlbench.cameras,
     )
-    # ManiFlowPreprocessAgent normalises uint8 RGB to [-1,1] and does NOT
-    # access YARR-specific keys (low_dim_state, demo, nerf_multi_view_rgb,
-    # lang_goal), so it is safe to use with the Zarr DataLoader.
-    preprocess_agent = ManiFlowPreprocessAgent(pose_agent=flow_stack_agent, norm_rgb=True)
+    preprocess_agent = PreprocessAgent(pose_agent=flow_stack_agent)
     return preprocess_agent

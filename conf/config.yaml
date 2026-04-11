@@ -23,22 +23,13 @@ rlbench:
     headless: True
 
 replay:
-    batch_size: 1
+    batch_size: 8
     timesteps: 1
     prioritisation: False
     task_uniform: True # uniform sampling of tasks for multi-task buffers
     use_disk: True
     path: '/tmp/arm/replay' # only used when use_disk is True.
     max_parallel_processes: 10
-    # Loader backend switch (ManiFlow_BC only):
-    #   False  → legacy YARR replay buffer (pickle-based, CPU pre-processing)
-    #   True   → fast Zarr DataLoader (LRU-cached, GPU pre-processing,
-    #             prefetch_factor=4, persistent_workers)
-    use_zarr_loader: False
-    zarr_path: 'data/train_zarr/train.zarr'  # path to the converted Zarr store
-    zarr_num_workers: 4                       # DataLoader worker processes
-    zarr_mem_gb: 8.0                          # LRU cache size per worker (GiB)
-    zarr_copies: 10                           # virtual dataset length multiplier
 
 evaluation: # for online evaluation
     eval_freq: 10000

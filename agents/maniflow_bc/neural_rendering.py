@@ -89,13 +89,28 @@ class NeuralRenderer(nn.Module):
 
     def _embed_loss_fn(self, render_embed, gt_embed):
         """
-        render_embed: [bs, h, w, 3]
-        gt_embed: [bs, h, w, 3]
+        render_embed: [bs, h, w, d_embed]
+        gt_embed:     [bs, h, w, d_embed]
+
+        Both sides are mean-centred and L2-normalised per-pixel before the
+        loss so that the rendered feature and the PCA-projected GT feature
+        live on the same unit-sphere manifold.  Without this normalisation,
+        cosine similarity between an arbitrary-mean MLP output and a zero-mean
+        PCA projection stays near zero throughout training, keeping the loss
+        stuck at ~1.
         """
+        MIN_DENOMINATOR = 1e-12
+
+        # --- canonical normalisation (both sides) ---
+        # 1. Mean-centre across the spatial dims so the rendered output matches
+        #    the zero-mean PCA target.
+        render_embed = render_embed - render_embed.mean(dim=(1, 2), keepdim=True)
+        gt_embed     = gt_embed     - gt_embed.mean(dim=(1, 2), keepdim=True)
+        # 2. Scale to unit range so magnitude differences don't confuse the loss.
+        render_embed = render_embed / (render_embed.norm(dim=-1, keepdim=True) + MIN_DENOMINATOR)
+        gt_embed     = gt_embed     / (gt_embed.norm(dim=-1, keepdim=True) + MIN_DENOMINATOR)
+
         if self.loss_embed_fn == "l2_norm":
-            # label normalization
-            MIN_DENOMINATOR = 1e-12
-            gt_embed = (gt_embed - gt_embed.min()) / (gt_embed.max() - gt_embed.min() + MIN_DENOMINATOR)
             loss_embed = l2_loss(render_embed, gt_embed)
         elif self.loss_embed_fn == "l2":
             loss_embed = l2_loss(render_embed, gt_embed)
@@ -103,6 +118,7 @@ class NeuralRenderer(nn.Module):
             loss_embed = cosine_loss(render_embed, gt_embed)
         else:
             cprint(f"loss_embed_fn {self.loss_embed_fn} is not implemented", "yellow")
+            loss_embed = torch.tensor(0., device=render_embed.device)
         return loss_embed
 
     def _save_gradient(self, name):

@@ -32,6 +32,7 @@ nerf_bc_data/
 multi_task_data/
 generalization_train_data/
 generalization_test_data/
+third_party/3d_flowmatch_actor/
 test_data/
 train_data/
 test/

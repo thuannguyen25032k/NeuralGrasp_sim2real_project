@@ -38,10 +38,25 @@ class PreprocessAgent(Agent):
             nerf_next_multi_view_camera = replay_sample['nerf_next_multi_view_camera']
         lang_goal = replay_sample['lang_goal']
 
-        if replay_sample['nerf_multi_view_rgb'] is None or replay_sample['nerf_multi_view_rgb'][0,0] is None:
-            cprint("preprocess agent no nerf rgb 1", "red")
+        if replay_sample['nerf_multi_view_rgb'] is None:
+            pass  # expected when use_neural_rendering=False
+        else:
+            try:
+                if replay_sample['nerf_multi_view_rgb'][0, 0] is None:
+                    cprint("preprocess agent no nerf rgb 1", "red")
+            except Exception:
+                pass
 
-        replay_sample = {k: v[:, 0] if len(v.shape) > 2 else v for k, v in replay_sample.items()}
+        def _strip_time(v):
+            """Remove the YARR timestep dimension (dim-1) from a tensor.
+            Non-tensor values (str, None, object arrays without .shape) are
+            returned unchanged so the dict comprehension never crashes."""
+            try:
+                return v[:, 0] if len(v.shape) > 2 else v
+            except (AttributeError, TypeError):
+                return v
+
+        replay_sample = {k: _strip_time(v) for k, v in replay_sample.items()}
 
         for k, v in replay_sample.items():
             if self._norm_rgb and 'rgb' in k and 'nerf' not in k:
@@ -67,8 +82,14 @@ class PreprocessAgent(Agent):
         self._replay_sample = replay_sample
 
 
-        if replay_sample['nerf_multi_view_rgb'] is None or replay_sample['nerf_multi_view_rgb'][0,0] is None:
-            cprint("preprocess agent no nerf rgb 2", "red")
+        if replay_sample['nerf_multi_view_rgb'] is None:
+            pass  # expected when use_neural_rendering=False
+        else:
+            try:
+                if replay_sample['nerf_multi_view_rgb'][0, 0] is None:
+                    cprint("preprocess agent no nerf rgb 2", "red")
+            except Exception:
+                pass
 
         return self._pose_agent.update(step, replay_sample, **kwargs)
 
@@ -76,7 +97,7 @@ class PreprocessAgent(Agent):
             deterministic=False) -> ActResult:
 
         for k, v in observation.items():
-            if self._norm_rgb and 'rgb' in k:
+            if self._norm_rgb and 'rgb' in k and 'nerf' not in k:
                 observation[k] = self._norm_rgb_(v)
             else:
                 try:

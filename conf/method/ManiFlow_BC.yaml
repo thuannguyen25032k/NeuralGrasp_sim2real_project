@@ -41,7 +41,7 @@ lang_fusion_type: 'seq'   # 'seq' or 'concat'
 #             → cross-attn to voxel tokens  (2 layers, 3D RoPE, AdaLN)
 #             → joint self-attn trunk       (num_shared_attn_layers, AdaLN)
 #             → pos head  (2-layer self-attn → Linear → 3)
-#             → rot head  (2-layer self-attn → Linear → 4)
+#             → rot head  (2-layer self-attn → Linear → 6, ortho6D)
 #             → grip head (Linear → 1)
 #   AdaLN conditioning signal = time_emb(t) + proprio_proj(gripper_state)
 # -----------------------------------------------------------------------
@@ -51,10 +51,15 @@ action_dim: 8             # [x, y, z, qx, qy, qz, qw, gripper]
 # embedding_dim: feature dimension for all Transformer layers.
 #   Must be divisible by num_attn_heads.
 #   Larger = more capacity, higher memory/compute cost.
+#   120 → ~2M params (too small); 192 → ~6M; 256 → ~14M (matches typical
+#   3D FlowMatch Actor scale for single-task learning).
 embedding_dim: 120
 
 # num_attn_heads: number of attention heads in every AttentionModule.
-#   embedding_dim / num_attn_heads = head dimension (here: 15).
+#   embedding_dim / num_attn_heads = head dimension.
+#   120 / 8 = 15 (good); 192 / 8 = 24; 256 / 8 = 32.
+#   120 matches the reference 3D FlowMatch Actor default and regularises
+#   better with small datasets (20 demos).
 num_attn_heads: 8
 
 # num_shared_attn_layers: depth of the joint action+voxel self-attention
@@ -72,9 +77,42 @@ voxel_token_downsample: 5
 #   Set to 0 to disable FPS and keep all N tokens.
 num_fps_tokens: 512
 
+# -----------------------------------------------------------------------
+# CLIP backbone option (replaces 3D-CNN with CLIP RN50 + feature lifter)
+# -----------------------------------------------------------------------
+# use_clip_backbone: if True, run CLIP RN50 on the raw 2D RGB image and
+#   lift the 2D features into the 3D voxel volume via point-cloud backprojection.
+#   This replaces MultiLayer3DEncoderShallow with CLIPVoxelLifter.
+#   The rest of VoxelFlowEncoder (Transformer head, GS renderer) is unchanged.
+#   Requires rgb and pcd to be passed through QFunctionFlow.encode_scene.
+#
+# finetune_clip_backbone: allow gradients through the CLIP ResNet50.
+#   Keep False (frozen) for 20-demo training to avoid overfitting.
+use_clip_backbone: True
+finetune_clip_backbone: False
+
 # denoise_timesteps: number of rectified-flow denoising steps at inference.
 #   Does not affect training (training uses a single random t ~ U[0,1]).
-denoise_timesteps: 100
+denoise_timesteps: 10
+
+# action_chunk_size: number of action steps to predict per denoising call.
+#   T=1  → single next-step prediction (backward-compatible default).
+#   T>1  → predict a chunk / trajectory of T future steps; only the first
+#           step is executed at inference time.
+action_chunk_size: 1
+
+# lv2_batch_size: number of inner noise re-sampling iterations in the loss.
+#   Each iteration re-samples a new noise tensor and a new timestep, but
+#   reuses the same encoded scene context — effectively multiplying the
+#   gradient diversity by N without re-running the 3D-CNN encoder.
+#   1 = no inner loop (standard RF loss); 2-4 = recommended for better grad.
+lv2_batch_size: 4
+
+# workspace_bounds: [x_min, y_min, z_min, x_max, y_max, z_max]
+#   Used to normalise xyz to [-1, 1] before the rectified-flow process.
+#   Must match the rlbench.scene_bounds used during data collection.
+#   Defaults to scene_bounds if not set here.
+workspace_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
 
 # --- Legacy MLP stubs (NOT used — kept only for YAML backward-compat) ---
 # These keys were present in an earlier MLP-based prototype.
@@ -83,7 +121,8 @@ flow_context_dim: 256   # ignored
 flow_hidden_dim: 512    # ignored
 flow_num_layers: 4      # ignored
 
-# Flow-matching loss weights
+# Flow-matching loss weights (matching base_denoise_actor defaults exactly)
+# pos_loss_weight=30, grip_loss_weight=1 match the original 3D FlowMatch Actor.
 pos_loss_weight: 30.0
 rot_loss_weight: 10.0
 grip_loss_weight: 1.0
@@ -94,10 +133,14 @@ grip_loss_weight: 1.0
 activation: lrelu
 norm: None
 
-lr: 0.0005
-lr_scheduler: False
-num_warmup_steps: 3000
-optimizer: 'lamb'           # 'lamb' or 'adam'
+# Reference 3D FlowMatch Actor uses lr=1e-4 with a constant LR schedule
+# and Adam optimizer — NOT LAMB and NOT cosine.
+# LAMB + lr=0.005 (the PerAct default) is 50x too high for a flow-matching
+# Transformer and causes the loss to plateau after ~2k steps.
+lr: 0.0001
+lr_scheduler: False         # constant LR — matches reference exactly
+num_warmup_steps: 0
+optimizer: 'adam'           # 'adam' matches reference; 'lamb' overshoots
 lambda_weight_l2: 0.000001
 
 # BC loss coefficient
@@ -132,8 +175,24 @@ neural_renderer:
   use_clip: False
   use_dynamic_field: False
 
-  lambda_nerf: 0.01
-  lambda_embed: 0.01
+  # -----------------------------------------------------------------------
+  # NeRF auxiliary loss weights
+  # -----------------------------------------------------------------------
+  # lambda_nerf: outer weight on the entire nerf_loss before adding to
+  #   total_loss.  Keep small so the GS renderer doesn't distort the BC
+  #   policy gradient.  0.02 gives the renderer ~0.1% of total gradient,
+  #   enough to train the GS model without interfering with flow_loss.
+  #
+  # lambda_rgb: weight on per-pixel L2 reconstruction inside nerf_loss.
+  #   Already the dominant NeRF signal, keep at 1.0.
+  #
+  # lambda_embed: weight on cosine embed loss INSIDE nerf_loss.
+  #   Effective total weight = lambda_nerf × lambda_embed.
+  #   Old: 0.01 × 0.01 = 0.0001  (negligible — embed never trained).
+  #   New: 0.02 × 0.5  = 0.01    (10× larger, meaningful signal).
+  # -----------------------------------------------------------------------
+  lambda_nerf: 0.02
+  lambda_embed: 0.5
   lambda_rgb: 1.0
   lambda_l1: 1.0
   lambda_ssim: 0.0
@@ -149,7 +208,7 @@ neural_renderer:
     scale: 1.0
     mask_gt_rgb: False
 
-  foundation_model_name: null
+  foundation_model_name: null # or 'diffusion' or 'dinov2'
   d_embed: 3
   loss_embed_fn: cosine
 

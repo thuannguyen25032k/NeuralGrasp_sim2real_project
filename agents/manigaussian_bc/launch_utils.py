@@ -282,6 +282,12 @@ def fill_replay(cfg: DictConfig,
                 language_model = None,
                 device = 'cpu',
                 keypoint_method = 'heuristic'):
+    # Create the language model inside the worker process so it is
+    # constructed directly on the target device.  Passing a CUDA-backed
+    # model from the parent process causes fp16 weights to silently land
+    # on CPU inside the child, triggering "addmm_impl_cpu_ not implemented
+    # for Half".
+    language_model = create_language_model(name=cfg.method.language_model, device=device)
     logging.getLogger().setLevel(cfg.framework.logging_level)        
 
     logging.debug('Filling %s replay ...' % task)
@@ -363,9 +369,6 @@ def fill_multi_task_replay(cfg: DictConfig,
     processes = []
     n = np.arange(len(tasks))
     split_n = utils.split_list(n, max_parallel_processes)
-    
-    device = fabric.device if fabric is not None else None
-    language_model = create_language_model(name=cfg.method.language_model, device=device)
 
     for split in split_n:
         for e_idx, task_idx in enumerate(split):
@@ -386,7 +389,7 @@ def fill_multi_task_replay(cfg: DictConfig,
                                                   bounds_offset,
                                                   rotation_resolution,
                                                   crop_augmentation,
-                                                  language_model,
+                                                  None,
                                                   model_device,
                                                   keypoint_method))
             p.start()
