@@ -1356,6 +1356,7 @@ class ManiFlowBCAgent(Agent):
             # / 'proprio_proj.0.bias').  The current code uses a bare nn.Linear
             # (keys: 'proprio_proj.weight' / 'proprio_proj.bias').  Remap old
             # Sequential keys so the weights are not silently discarded.
+            # Safe no-op for current checkpoints that already use the new key.
             # ------------------------------------------------------------------
             k = k.replace('proprio_proj.0.weight', 'proprio_proj.weight')
             k = k.replace('proprio_proj.0.bias',   'proprio_proj.bias')

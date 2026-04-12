@@ -53,10 +53,10 @@ action_dim: 8             # [x, y, z, qx, qy, qz, qw, gripper]
 #   Larger = more capacity, higher memory/compute cost.
 #   120 → ~2M params (too small); 192 → ~6M; 256 → ~14M (matches typical
 #   3D FlowMatch Actor scale for single-task learning).
-#   NOTE: existing checkpoints were trained with 120. Change only when
+#   NOTE: existing checkpoints were trained with 256. Change only when
 #   starting a fresh training run — mismatching causes all transformer
 #   weights to be silently dropped at eval (shape mismatch → random init).
-embedding_dim: 120
+embedding_dim: 256
 
 # num_attn_heads: number of attention heads in every AttentionModule.
 #   embedding_dim / num_attn_heads = head dimension.
