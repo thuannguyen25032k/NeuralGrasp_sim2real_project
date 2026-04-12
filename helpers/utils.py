@@ -380,6 +380,18 @@ def extract_obs(obs: Observation,
     for camera_name in cameras:
         obs_dict['%s_camera_extrinsics' % camera_name] = obs.misc['%s_camera_extrinsics' % camera_name]
         obs_dict['%s_camera_intrinsics' % camera_name] = obs.misc['%s_camera_intrinsics' % camera_name]
+        # When use_depth=False the depth array is None and gets filtered out
+        # above, but the replay buffer always expects a '%s_depth' slot.
+        # Fill with zeros whose spatial dims match the corresponding RGB.
+        depth_key = '%s_depth' % camera_name
+        if depth_key not in obs_dict:
+            rgb_key = '%s_rgb' % camera_name
+            if rgb_key in obs_dict:
+                # RGB is (3, H, W) after the channels-first transpose above.
+                h, w = obs_dict[rgb_key].shape[1], obs_dict[rgb_key].shape[2]
+            else:
+                h, w = 128, 128   # safe default
+            obs_dict[depth_key] = np.zeros((1, h, w), dtype=np.float32)
 
     # add timestep to low_dim_state
     time = (1. - (t / float(episode_length - 1))) * 2. - 1.

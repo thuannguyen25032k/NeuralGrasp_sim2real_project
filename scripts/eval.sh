@@ -1,7 +1,10 @@
 # this script is for evaluating a given checkpoint.
+# Usage: bash scripts/eval.sh <method> <exp_name> [GPU_ID] [eval_envs]
 # example to evaluate our ManiGaussian:
 #       bash scripts/eval.sh ManiGaussian_BC ${exp_name} 0
 # Other examples:
+#       bash scripts/eval.sh ManiFlow_BC ${exp_name} 0
+#       bash scripts/eval.sh ManiFlow_BC ${exp_name} 0 1   # 1 parallel env (safe on 1 GPU)
 #       bash scripts/eval.sh GNFACTOR_BC ${exp_name} 0
 #       bash scripts/eval.sh PERACT_BC ${exp_name} 0
 
@@ -13,6 +16,8 @@ exp_name=$2
 seed="0"
 # set the gpu id for evaluation. we use one gpu for parallel evaluation.
 eval_gpu=${3:-"0"}
+# number of parallel eval environments (5 default from eval.yaml; reduce if OOM)
+eval_envs=${4:-"1"}
 
 cur_dir=$(pwd)
 train_demo_path="${cur_dir}/data/train_data"
@@ -31,6 +36,7 @@ if [ "${use_split}" == "train" ]; then
         rlbench.tasks=${tasks} \
         rlbench.demo_path=${train_demo_path} \
         framework.start_seed=${seed} \
+        framework.eval_envs=${eval_envs} \
         framework.eval_episodes=15
 
 else
@@ -42,6 +48,7 @@ else
         rlbench.tasks=${tasks} \
         rlbench.demo_path=${test_demo_path} \
         framework.start_seed=${seed} \
+        framework.eval_envs=${eval_envs} \
         framework.eval_type=last
 fi
 

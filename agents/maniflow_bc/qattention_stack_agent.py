@@ -33,8 +33,16 @@ class ManiFlowStackAgent(Agent):
 
     # ------------------------------------------------------------------
     def update(self, step: int, replay_sample: dict, **kwargs) -> dict:
-        if (replay_sample['nerf_multi_view_rgb'] is None
-                or replay_sample['nerf_multi_view_rgb'][0, 0] is None):
+        # Only warn about missing NeRF data when neural rendering is actually
+        # enabled; when use_neural_rendering=False the paths are always None.
+        _uses_nerf = any(
+            getattr(qa, 'use_neural_rendering', False)
+            for qa in self._qattention_agents
+        )
+        if _uses_nerf and (
+            replay_sample['nerf_multi_view_rgb'] is None
+            or replay_sample['nerf_multi_view_rgb'][0, 0] is None
+        ):
             cprint("ManiFlowStackAgent: no nerf rgb in sample", "red")
 
         total_losses = 0.

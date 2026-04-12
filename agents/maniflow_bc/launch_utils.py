@@ -11,7 +11,6 @@ Mirrors agents/manigaussian_bc/launch_utils.py but:
 """
 
 import logging
-import random
 from typing import List
 
 import numpy as np
@@ -27,7 +26,6 @@ from yarr.replay_buffer.uniform_replay_buffer_single_process import UniformRepla
 
 from helpers import demo_loading_utils, utils
 from helpers.preprocess_agent import PreprocessAgent
-from helpers.clip.core.clip import tokenize
 from helpers.language_model import create_language_model
 
 from agents.maniflow_bc.voxel_flow_encoder import VoxelFlowEncoder

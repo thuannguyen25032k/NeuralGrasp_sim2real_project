@@ -45,7 +45,6 @@ Internal (flow space): 9-DoF trajectory token [x_norm,y_norm,z_norm, r1..r6]
   + 1 grip logit predicted separately via BCE.
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,8 +53,6 @@ from einops import rearrange
 from torchvision.ops import FeaturePyramidNetwork
 
 from helpers.network_utils import (
-    DenseBlock,
-    SpatialSoftmax3D,
     MultiLayer3DEncoderShallow,
 )
 from agents.maniflow_bc.position_encodings import (
@@ -138,10 +135,17 @@ class _EfficientFPN(FeaturePyramidNetwork):
         if self.extra_blocks is not None:
             results, result_names = self.extra_blocks(results, values, result_names)
 
-        return OrderedDict({
+        out_dict = OrderedDict({
             k: v.contiguous(memory_format=torch.contiguous_format)
             for k, v in zip(result_names, results)
         })
+        if self.output_level not in out_dict:
+            raise KeyError(
+                f"_EfficientFPN: expected output level '{self.output_level}' "
+                f"not found in computed levels {list(out_dict.keys())}. "
+                f"Check that 'output_level' matches one of the input feature names."
+            )
+        return out_dict
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +187,13 @@ class CLIPVoxelLifter(nn.Module):
     clip_model : nn.Module
         The CLIP visual encoder (ModifiedResNet), e.g. `clip_full.visual`.
     embedding_dim : int
-        Output feature dimension — equals VoxelFlowEncoder.embedding_dim.
-        The FPN projects all feature levels to this width directly.
+        Internal feature dimension used by the FPN, vl_attention, and lifting.
+        The FPN projects all feature levels to this width.
+    out_channels : int
+        Output channel dimension of the voxel volume returned by forward().
+        Equals VoxelFlowEncoder.im_channels.  A two-layer 1×1×1 Conv3d MLP
+        (Conv → GroupNorm → ReLU → Conv) projects embedding_dim → out_channels,
+        bridging CLIP feature space to the neural-rendering (GS renderer) space.
     voxel_size : int
         Number of voxel cells per side (default 100).
     coordinate_bounds : torch.Tensor, shape (6,)
@@ -213,6 +222,7 @@ class CLIPVoxelLifter(nn.Module):
         self,
         clip_model: nn.Module,
         embedding_dim: int = 120,
+        out_channels: int = None,        # if None, defaults to embedding_dim (no projection)
         voxel_size: int = 100,
         coordinate_bounds: torch.Tensor = None,
         num_attn_heads: int = 8,
@@ -223,6 +233,20 @@ class CLIPVoxelLifter(nn.Module):
         self.voxel_size = voxel_size
         self.embedding_dim = embedding_dim
         self.clip_visual = clip_model   # ModifiedResNet (CLIP RN50 visual encoder)
+
+        if out_channels is None:
+            out_channels = embedding_dim
+        # MLP connector: project from CLIP feature space (embedding_dim) to
+        # neural-rendering space (out_channels = im_channels).
+        # Conv3d(k=1) acts as a per-voxel linear layer; GroupNorm(1, C) is
+        # equivalent to LayerNorm over the channel axis for 3D volumes (where
+        # nn.LayerNorm(C) cannot be applied directly to (B,C,V,V,V) tensors).
+        self.clip_renderer_proj = nn.Sequential(
+            nn.Conv3d(embedding_dim, out_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(1, out_channels),   # channel-wise LayerNorm for (B,C,V,V,V)
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_channels, out_channels, kernel_size=1, bias=True),
+        )
 
         if not finetune_backbone:
             for p in self.clip_visual.parameters():
@@ -312,17 +336,112 @@ class CLIPVoxelLifter(nn.Module):
         rgb_01 = (rgb * 0.5 + 0.5).clamp(0.0, 1.0)
         return (rgb_01 - self.clip_mean) / self.clip_std
 
-    def _lift_to_voxel(
+    def forward(
         self,
-        feats_2d: torch.Tensor,   # (B, C, H_f, W_f)  features at FPN output resolution
-        pcd:      torch.Tensor,   # (B, 3, H_img, W_img) world XYZ per pixel
-    ) -> torch.Tensor:
+        rgb:         torch.Tensor,   # (B, 3, H, W) or list[(B,3,H,W)]  ManiFlow RGB in [-1,1]
+        pcd:         torch.Tensor,   # (B, 3, H, W) or list[(B,3,H,W)]  world XYZ per pixel
+        lang_tokens: torch.Tensor,   # (B, L, embedding_dim)  projected lang tokens
+    ):
         """
-        Lift 2D per-pixel features into a 3D voxel volume via scatter_add.
+        Accepts either a single (rgb, pcd) pair or lists of per-camera pairs.
+        When lists are provided all cameras are processed and their lifted
+        voxel features are averaged before the final LayerNorm — this gives
+        the same multi-camera coverage as the 3D-CNN voxelization path.
 
         Returns
         -------
-        voxel_vol : (B, C, V, V, V)  averaged features per voxel cell
+        (voxel_feat, [])
+            voxel_feat : (B, out_channels, V, V, V)  — equals (B, im_channels, V, V, V)
+        """
+        # Normalise inputs to lists so the rest of the function is uniform.
+        if isinstance(rgb, (list, tuple)):
+            rgb_list = rgb
+            pcd_list = pcd
+        else:
+            rgb_list = [rgb]
+            pcd_list = [pcd]
+
+        _frozen = not any(p.requires_grad for p in self.clip_visual.parameters())
+
+        # Accumulate per-camera lifted volumes; average at the end.
+        voxel_acc   = None
+        count_acc   = None   # (B, V^3) — number of cameras that contributed to each voxel
+
+        for rgb_cam, pcd_cam in zip(rgb_list, pcd_list):
+            # 1. CLIP normalise
+            rgb_clip = self._normalize_clip(rgb_cam)
+
+            # 2. Extract all 5 CLIP feature levels
+            if _frozen:
+                with torch.no_grad():
+                    feat_dict = self._extract_multi_level(rgb_clip)
+            else:
+                feat_dict = self._extract_multi_level(rgb_clip)
+
+            # 3. [Gap #1] FPN: multi-scale fusion → res3 at (B, emb, H/8, W/8)
+            fpn_out  = self.feature_pyramid(feat_dict)   # OrderedDict {'res3': ...}
+            feat2d   = fpn_out['res3']                   # (B, embedding_dim, H/8, W/8)
+            B, C_emb, H_f, W_f = feat2d.shape
+
+            # 4. [Gap #2] Vision→Language cross-attention
+            N_pix = H_f * W_f
+            vis_tokens = feat2d.permute(0, 2, 3, 1).reshape(B, N_pix, C_emb)  # (B, N, emb)
+            vis_tokens = self.vl_attention(
+                seq1=vis_tokens,
+                seq2=lang_tokens,
+            )[-1]                                                                # (B, N, emb)
+            feat2d = vis_tokens.reshape(B, H_f, W_f, C_emb).permute(0, 3, 1, 2)  # (B,emb,H,W)
+
+            # 5. Lift into voxel volume — returns (B, emb, V, V, V)
+            # _lift_to_voxel already averages per voxel within one camera view;
+            # here we additionally average across cameras.
+            V = self.voxel_size
+            vox_sum_cam, vox_cnt_cam = self._lift_to_voxel_raw(feat2d, pcd_cam)
+            if voxel_acc is None:
+                voxel_acc = vox_sum_cam          # (B, V^3, C)
+                count_acc = vox_cnt_cam          # (B, V^3, 1)
+            else:
+                voxel_acc = voxel_acc + vox_sum_cam
+                count_acc = count_acc + vox_cnt_cam
+
+        # Average across all cameras
+        voxel_avg = voxel_acc / (count_acc + 1e-8)           # (B, V^3, C)
+        voxel_vol = voxel_avg.reshape(B, V, V, V, C_emb).permute(0, 4, 1, 2, 3)  # (B,C,V,V,V)
+
+        # 6. Final LayerNorm — apply only to occupied voxels to avoid the
+        # normalisation statistics being dominated by the many zero-filled
+        # empty-space voxels, which would wash out the object-surface signal.
+        occupied_mask = (count_acc.squeeze(-1) > 0).reshape(B, -1)  # (B, V^3)
+        B2, C2, V1, V2, V3 = voxel_vol.shape
+        flat = voxel_vol.permute(0, 2, 3, 4, 1).reshape(B2, -1, C2)  # (B, V^3, C)
+        # Normalise all positions but bias only occupied ones (common trick):
+        # use full LayerNorm then zero-out the unoccupied voxels so downstream
+        # scatter / pool operations are not affected by ghost features.
+        flat_normed = self.out_norm(flat.reshape(-1, C2)).reshape(B2, -1, C2)
+        flat_normed = flat_normed * occupied_mask.unsqueeze(-1).float()
+        out = flat_normed.reshape(B2, V1, V2, V3, C2).permute(0, 4, 1, 2, 3)  # (B,C,V,V,V)
+        # Project embedding_dim → out_channels (= im_channels) for the GS renderer.
+        out = self.clip_renderer_proj(out)   # (B, out_channels, V, V, V)
+        return out, []
+
+    # ---------------------------------------------------------------------- #
+    # _lift_to_voxel_raw — returns (sum, count) without dividing/normalising  #
+    # ---------------------------------------------------------------------- #
+
+    def _lift_to_voxel_raw(
+        self,
+        feats_2d: torch.Tensor,   # (B, C, H_f, W_f)
+        pcd:      torch.Tensor,   # (B, 3, H_img, W_img)
+    ):
+        """
+        Like _lift_to_voxel but returns the raw (voxel_sum, voxel_count) so
+        the caller can accumulate contributions from multiple cameras before
+        dividing.
+
+        Returns
+        -------
+        voxel_sum   : (B, V^3, C)
+        voxel_count : (B, V^3, 1)
         """
         B, C, H_f, W_f = feats_2d.shape
         V = self.voxel_size
@@ -331,23 +450,20 @@ class CLIPVoxelLifter(nn.Module):
         bb_min = self.coord_bounds[:3].to(device)
         bb_max = self.coord_bounds[3:].to(device)
 
-        # Bilinearly downsample pcd to feature map resolution
         pcd_ds = F.interpolate(pcd.float(), size=(H_f, W_f),
-                               mode='bilinear', align_corners=False)  # (B,3,H_f,W_f)
-
-        pcd_flat  = pcd_ds.permute(0, 2, 3, 1).reshape(B, -1, 3)    # (B, N, 3)
-        feat_flat = feats_2d.permute(0, 2, 3, 1).reshape(B, -1, C)  # (B, N, C)
+                               mode='bilinear', align_corners=False)
+        pcd_flat  = pcd_ds.permute(0, 2, 3, 1).reshape(B, -1, 3)
+        feat_flat = feats_2d.permute(0, 2, 3, 1).reshape(B, -1, C)
         N = pcd_flat.shape[1]
 
-        # Bin world coords into voxel grid [0, V-1]^3
         pcd_clamped = pcd_flat.clamp(
             min=bb_min.unsqueeze(0).unsqueeze(0),
             max=bb_max.unsqueeze(0).unsqueeze(0),
         )
         vox_float = (pcd_clamped - bb_min) / (bb_max - bb_min + 1e-8) * V
-        vox_idx   = vox_float.long().clamp(0, V - 1)  # (B, N, 3)
+        vox_idx   = vox_float.long().clamp(0, V - 1)
         ix, iy, iz = vox_idx[..., 0], vox_idx[..., 1], vox_idx[..., 2]
-        lin_idx = ix * (V * V) + iy * V + iz           # (B, N)
+        lin_idx = ix * (V * V) + iy * V + iz
 
         voxel_sum   = torch.zeros(B, V*V*V, C, device=device, dtype=feat_flat.dtype)
         voxel_count = torch.zeros(B, V*V*V, 1, device=device, dtype=feat_flat.dtype)
@@ -355,57 +471,7 @@ class CLIPVoxelLifter(nn.Module):
         voxel_sum.scatter_add_(1, lin_idx_exp.expand(-1, -1, C), feat_flat)
         voxel_count.scatter_add_(1, lin_idx_exp,
                                  torch.ones(B, N, 1, device=device, dtype=feat_flat.dtype))
-
-        voxel_avg = voxel_sum / (voxel_count + 1e-8)               # (B, V^3, C)
-        voxel_vol = voxel_avg.reshape(B, V, V, V, C).permute(0, 4, 1, 2, 3)  # (B,C,V,V,V)
-        return voxel_vol
-
-    def forward(
-        self,
-        rgb:         torch.Tensor,   # (B, 3, H, W)  ManiFlow RGB in [-1,1]
-        pcd:         torch.Tensor,   # (B, 3, H, W)  world XYZ per pixel
-        lang_tokens: torch.Tensor,   # (B, L, embedding_dim)  projected lang tokens
-    ):
-        """
-        Returns
-        -------
-        (voxel_feat, [])
-            voxel_feat : (B, embedding_dim, V, V, V)
-        """
-        # 1. CLIP normalise
-        rgb_clip = self._normalize_clip(rgb)
-
-        # 2. Extract all 5 CLIP feature levels
-        _frozen = not any(p.requires_grad for p in self.clip_visual.parameters())
-        if _frozen:
-            with torch.no_grad():
-                feat_dict = self._extract_multi_level(rgb_clip)
-        else:
-            feat_dict = self._extract_multi_level(rgb_clip)
-
-        # 3. [Gap #1] FPN: multi-scale fusion → res3 at (B, emb, H/8, W/8)
-        fpn_out  = self.feature_pyramid(feat_dict)   # OrderedDict {'res3': ...}
-        feat2d   = fpn_out['res3']                   # (B, embedding_dim, H/8, W/8)
-        B, C_emb, H_f, W_f = feat2d.shape
-
-        # 4. [Gap #2] Vision→Language cross-attention
-        N_pix = H_f * W_f
-        vis_tokens = feat2d.permute(0, 2, 3, 1).reshape(B, N_pix, C_emb)  # (B, N, emb)
-        vis_tokens = self.vl_attention(
-            seq1=vis_tokens,
-            seq2=lang_tokens,
-        )[-1]                                                                # (B, N, emb)
-        feat2d = vis_tokens.reshape(B, H_f, W_f, C_emb).permute(0, 3, 1, 2)  # (B,emb,H,W)
-
-        # 5. Lift into voxel volume
-        voxel_vol = self._lift_to_voxel(feat2d, pcd)   # (B, emb, V, V, V)
-
-        # 6. Final LayerNorm
-        B2, C2, V1, V2, V3 = voxel_vol.shape
-        out = self.out_norm(
-            voxel_vol.permute(0, 2, 3, 4, 1).reshape(-1, C2)
-        ).reshape(B2, V1, V2, V3, C2).permute(0, 4, 1, 2, 3)   # (B, emb, V, V, V)
-        return out, []
+        return voxel_sum, voxel_count
 
 
 # ---------------------------------------------------------------------------
@@ -472,8 +538,15 @@ class TransformerHead(nn.Module):
         # Step positional embedding for trajectory tokens
         self.traj_time_emb = SinusoidalPosEmb(embedding_dim)
 
-        # ---- 3D RoPE for voxel positions --------------------------------- #
-        self.relative_pe_layer = RotaryPositionEncoding3D(embedding_dim)
+        # NOTE: 3D RoPE is NOT duplicated here.
+        # VoxelFlowEncoder.relative_pe_layer is the single shared RoPE layer.
+        # TransformerHead receives pre-computed RoPE tensors (rel_vox_pos,
+        # rel_traj_pos) passed in by VoxelFlowEncoder.predict_velocity so that
+        # voxel tokens and trajectory positions are encoded with the SAME RoPE
+        # weights used by gripper_context_head.  Having two separate
+        # RotaryPositionEncoding3D instances (different random inits) would
+        # encode the same world coordinate differently, making spatial attention
+        # incoherent between the gripper-context and the denoising head.
 
         # ---- Cross-attention: trajectory query -> language --------------- #
         self.traj_lang_attention = AttentionModule(
@@ -574,13 +647,15 @@ class TransformerHead(nn.Module):
 
     def forward(
         self,
-        noisy_trajectory: torch.Tensor,            # (B, T, 9)  pos_norm+rot6d
-        timestep:         torch.Tensor,            # (B,)  float in [0,1]
-        voxel_tokens:     torch.Tensor,            # (B, N_vox, embedding_dim)
-        voxel_pos:        torch.Tensor,            # (B, N_vox, 3)  world coords
-        lang_tokens:      torch.Tensor,            # (B, L, embedding_dim)
-        proprio_feats:    torch.Tensor = None,     # (B, embedding_dim)  pre-projected
-        coord_bounds:     torch.Tensor = None,     # (6,) [x_min,y_min,z_min,x_max,y_max,z_max]
+        noisy_trajectory:  torch.Tensor,            # (B, T, 9)  pos_norm+rot6d
+        timestep:          torch.Tensor,            # (B,)  float in [0,1]
+        fps_vox_tokens:    torch.Tensor,            # (B, M, embedding_dim)  DPS-subsampled
+        rel_fps_vox_pos:   torch.Tensor,            # (B, M, emb, 2)  pre-computed 3D RoPE
+        full_vox_tokens:   torch.Tensor,            # (B, N, embedding_dim)  full set (no DPS)
+        rel_full_vox_pos:  torch.Tensor,            # (B, N, emb, 2)  pre-computed 3D RoPE
+        rel_traj_pos:      torch.Tensor,            # (B, T,     emb, 2)  pre-computed 3D RoPE
+        lang_tokens:       torch.Tensor,            # (B, L, embedding_dim)
+        proprio_feats:     torch.Tensor = None,     # (B, embedding_dim)  pre-projected
     ):
         """
         Returns a list of length 1 containing (B, T, 10):
@@ -588,6 +663,12 @@ class TransformerHead(nn.Module):
         The list wrapper exactly matches base_denoise_actor's return convention
         (which may return multiple intermediate predictions for deep supervision;
         here we always return a single prediction).
+
+        NOTE: Two separate voxel-token sets are used — matching the reference:
+          • full_vox_tokens  (B, N, emb)  — cross_attn target (rgb3d_feats in ref)
+          • fps_vox_tokens   (B, M, emb)  — self_attn context (fps_scene_feats in ref)
+        rel_*_pos are 3D RoPE tensors pre-computed by VoxelFlowEncoder using its
+        shared relative_pe_layer.
         """
         B, T, _ = noisy_trajectory.shape
 
@@ -604,24 +685,6 @@ class TransformerHead(nn.Module):
         traj_time_pos = self.traj_time_emb(step_indices)                 # (T, emb)
         traj_time_pos = traj_time_pos.unsqueeze(0).expand(B, -1, -1)    # (B, T, emb)
 
-        # ---- 3D RoPE positions ------------------------------------------- #
-        rel_vox_pos  = self.relative_pe_layer(voxel_pos)          # (B, N, emb, 2)
-        # Trajectory xyz positions: unnormalize from [-1,1] to world coords
-        # so that RoPE encodes the same spatial scale as voxel_pos.
-        # Mirrors base_denoise_actor where traj_xyz = unnormalize_pos(traj)[..., :3].
-        # The noisy trajectory itself stays normalised for the flow process;
-        # unnormalization is only for RoPE to match voxel_pos coordinate space.
-        traj_xyz_norm = noisy_trajectory[:, :, :3]                # (B, T, 3) in [-1,1]
-        if coord_bounds is not None:
-            ws_min = coord_bounds[:3].to(traj_xyz_norm.device)    # (3,)
-            ws_max = coord_bounds[3:].to(traj_xyz_norm.device)    # (3,)
-            # [-1,1] → world coords: x_world = (x_norm + 1) / 2 * (max - min) + min
-            traj_xyz = (traj_xyz_norm + 1.0) / 2.0 * (ws_max - ws_min) + ws_min
-        else:
-            # Fallback: use normalised coords if bounds not supplied
-            traj_xyz = traj_xyz_norm
-        rel_traj_pos = self.relative_pe_layer(traj_xyz)           # (B, T, emb, 2)
-
         # ---- Cross-attention: trajectory -> language --------------------- #
         traj_feats = self.traj_lang_attention(
             seq1=traj_feats,
@@ -633,18 +696,20 @@ class TransformerHead(nn.Module):
         traj_feats = traj_feats + traj_time_pos
 
         # ---- Cross-attention: trajectory -> voxel scene ------------------ #
+        # Uses the FULL (N) token set — mirrors reference which cross-attends
+        # trajectory to rgb3d_feats (all tokens, never DPS-subsampled).
         traj_feats = self.cross_attn(
             seq1=traj_feats,
-            seq2=voxel_tokens,
+            seq2=full_vox_tokens,
             seq1_pos=rel_traj_pos,
-            seq2_pos=rel_vox_pos,
+            seq2_pos=rel_full_vox_pos,
             ada_sgnl=time_embs,
         )[-1]   # (B, T, emb)
 
         # ---- Joint self-attention (trajectory tokens + FPS voxel tokens) - #
-        # Exactly mirrors base_denoise_actor: features = cat([traj, fps_scene])
-        joint_feats = torch.cat([traj_feats, voxel_tokens], dim=1)  # (B, T+N, emb)
-        joint_pos   = torch.cat([rel_traj_pos, rel_vox_pos], dim=1)
+        # Uses only DPS-subsampled tokens — mirrors reference fps_scene_feats.
+        joint_feats = torch.cat([traj_feats, fps_vox_tokens], dim=1)  # (B, T+M, emb)
+        joint_pos   = torch.cat([rel_traj_pos, rel_fps_vox_pos], dim=1)
 
         joint_feats = self.self_attn(
             seq1=joint_feats,
@@ -652,11 +717,11 @@ class TransformerHead(nn.Module):
             seq1_pos=joint_pos,
             seq2_pos=joint_pos,
             ada_sgnl=time_embs,
-        )[-1]   # (B, T+N, emb)
+        )[-1]   # (B, T+M, emb)
 
         # ---- Position head ----------------------------------------------- #
-        # Mirrors base_denoise_actor.predict_pos exactly:
-        #   position_features = position_self_attn(features, features, ...)[-1]
+        # Matches reference predict_pos exactly:
+        #   position_features = position_self_attn(features, ...)[-1]
         #   position_features = position_features[:, :traj_len]
         #   position_features = position_proj(position_features)
         #   position = position_predictor(position_features)
@@ -666,8 +731,8 @@ class TransformerHead(nn.Module):
             seq1_pos=joint_pos,
             seq2_pos=joint_pos,
             ada_sgnl=time_embs,
-        )[-1][:, :T, :]                          # slice traj tokens → (B, T, emb)
-        pos_feat  = self.position_proj(pos_feat)  # (B, T, emb)
+        )[-1][:, :T, :]                          # self_attn FIRST, then slice → (B, T, emb)
+        pos_feat  = self.position_proj(pos_feat)         # proj AFTER slice → (B, T, emb)
         position  = self.position_predictor(pos_feat)   # (B, T, 3)
 
         # ---- Rotation head ----------------------------------------------- #
@@ -677,13 +742,14 @@ class TransformerHead(nn.Module):
             seq1_pos=joint_pos,
             seq2_pos=joint_pos,
             ada_sgnl=time_embs,
-        )[-1][:, :T, :]                          # (B, T, emb)
-        rot_feat  = self.rotation_proj(rot_feat)  # (B, T, emb)
+        )[-1][:, :T, :]                          # self_attn FIRST, then slice → (B, T, emb)
+        rot_feat  = self.rotation_proj(rot_feat)         # proj AFTER slice → (B, T, emb)
         rotation  = self.rotation_predictor(rot_feat)   # (B, T, 6)
 
         # ---- Gripper head ------------------------------------------------ #
-        # Uses joint traj tokens from the shared trunk (matches base_denoise_actor)
-        openess = self.openess_predictor(joint_feats[:, :T, :])   # (B, T, 1)
+        # Reference: openess_predictor(position_features)
+        # i.e. the post-proj position features, NOT joint_feats (matches base_denoise_actor.forward)
+        openess = self.openess_predictor(pos_feat)   # (B, T, 1)
 
         out = torch.cat([position, rotation, openess], dim=-1)    # (B, T, 10)
         return [out]    # list wrapper mirrors base_denoise_actor return convention
@@ -692,7 +758,6 @@ class TransformerHead(nn.Module):
 # ---------------------------------------------------------------------------
 # VoxelFlowEncoder
 # ---------------------------------------------------------------------------
-
 class VoxelFlowEncoder(nn.Module):
     """
     3D-CNN voxel encoder + Transformer flow-matching action head.
@@ -738,7 +803,7 @@ class VoxelFlowEncoder(nn.Module):
     lang_fusion_type : str
         'seq' or 'concat' (default 'seq').
     activation : str
-        Activation for DenseBlock (default 'lrelu').
+        Activation function (default 'lrelu').
     cfg : DictConfig
         Full config passed through for NeuralRenderer compatibility.
     """
@@ -810,22 +875,13 @@ class VoxelFlowEncoder(nn.Module):
             self.clip_lifter = CLIPVoxelLifter(
                 clip_model=clip_full.visual,
                 embedding_dim=embedding_dim,
+                out_channels=im_channels,    # lifter projects internally → (B, im_channels, V, V, V)
                 voxel_size=voxel_size,
                 coordinate_bounds=torch.tensor(coordinate_bounds, dtype=torch.float32),
                 num_attn_heads=num_attn_heads,
                 num_vl_attn_layers=2,
                 finetune_backbone=finetune_clip_backbone,
             )
-            # Project the lifted voxel volume from embedding_dim → im_channels so
-            # the GS renderer (GeneralizableGSEmbedNet) always receives the
-            # expected d_latent=im_channels channels via F.grid_sample.
-            # A 1×1×1 conv preserves spatial dims and adds no receptive-field bias.
-            if embedding_dim != im_channels:
-                self.clip_renderer_proj = nn.Conv3d(
-                    embedding_dim, im_channels, kernel_size=1, bias=False
-                )
-            else:
-                self.clip_renderer_proj = nn.Identity()
         else:
             self.clip_lifter = None
             self.clip_renderer_proj = None
@@ -849,11 +905,11 @@ class VoxelFlowEncoder(nn.Module):
         # ------------------------------------------------------------------ #
         self._vox_ds = voxel_size // voxel_token_downsample   # downsampled side
 
-        # When use_clip_backbone=True, CLIPVoxelLifter outputs embedding_dim
-        # channels directly; when False, 3D-CNN outputs im_channels.
-        _vox_in_channels = embedding_dim if use_clip_backbone else im_channels
+        # Both paths output im_channels: the 3D-CNN directly, and CLIPVoxelLifter
+        # via its internal clip_renderer_proj.  Token projection is always
+        # im_channels → embedding_dim.
         self.voxel_token_proj = nn.Sequential(
-            nn.Linear(_vox_in_channels, embedding_dim),
+            nn.Linear(im_channels, embedding_dim),
             nn.LayerNorm(embedding_dim),
         )
         self.lang_token_proj = nn.Sequential(
@@ -969,6 +1025,11 @@ class VoxelFlowEncoder(nn.Module):
         chunking the query dimension so that only a (B, chunk, N) slice
         is live at any one time.  The chunk size is chosen so the slice
         fits comfortably in ~256 MB regardless of B, N, or C.
+
+        Self-distance (always 0) is excluded via ``k_eff = k+1`` and slicing
+        ``[:, :, 1:]``, giving exactly k true neighbour distances.  The reference
+        ``density_based_sampler`` inadvertently includes self-distance, biasing
+        all densities by a factor of (k-1)/k — harmless since it preserves ranking.
         """
         B, N, C = features.shape
         device  = features.device
@@ -988,12 +1049,12 @@ class VoxelFlowEncoder(nn.Module):
 
         density = torch.zeros(B, N, device=device)
 
-        f_norm = features  # (B, N, C)
+        feats_for_dist = features  # (B, N, C) — raw features (no L2 normalisation, matches reference)
         for start in range(0, N, chunk_size):
             end   = min(start + chunk_size, N)
-            q     = f_norm[:, start:end, :]          # (B, chunk, C)
+            q     = feats_for_dist[:, start:end, :]          # (B, chunk, C)
             # (B, chunk, N) — pairwise L2 between the chunk queries and all keys
-            d_chunk = torch.cdist(q, f_norm, p=2)    # (B, chunk, N)
+            d_chunk = torch.cdist(q, feats_for_dist, p=2)    # (B, chunk, N)
             knn_d, _ = d_chunk.topk(k=k_eff, dim=-1, largest=False)
             density[:, start:end] = knn_d[:, :, 1:].mean(dim=-1)
 
@@ -1053,28 +1114,20 @@ class VoxelFlowEncoder(nn.Module):
 
         # ---- Scene encoding --------------------------------------------- #
         if self.use_clip_backbone:
-            # CLIP ResNet50 backbone + vl_attention + feature-lifting connector
+            # CLIP ResNet50 backbone + vl_attention + feature-lifting connector.
+            # Returns (B, im_channels, V, V, V) directly — no extra projection needed.
             assert rgb is not None and pcd is not None, (
                 "rgb and pcd must be provided to encode_scene when use_clip_backbone=True"
             )
-            # Pass lang_tokens_emb so vl_attention can ground visual features.
-            # Returns (B, embedding_dim, V, V, V).
-            d0_emb, _ = self.clip_lifter(rgb, pcd, lang_tokens=lang_tokens_emb)
-            # Project to im_channels for the GS renderer (d_latent=im_channels).
-            # Transformer tokens are built from d0_emb (embedding_dim) below.
-            d0 = self.clip_renderer_proj(d0_emb)  # (B, im_channels, V, V, V)
+            d0, _ = self.clip_lifter(rgb, pcd, lang_tokens=lang_tokens_emb)     # d0: (B, im_channels, V, V, V) is the final output of CLIPVoxelLifter;
         else:
             # 3D-CNN on voxelised RGB (default)
-            d0, _ = self.encoder_3d(voxel_grid)   # (B, im_channels, V, V, V)
-            d0_emb = d0                            # same tensor; same channels
+            d0, _ = self.encoder_3d(voxel_grid)   # d0: (B, im_channels, V, V, V) is the final output of the 3D-CNN encoder
 
         # Downsample voxel volume -> token sequence
         ds = self._vox_ds
-        # Use d0_emb (embedding_dim channels) for Transformer tokens so the
-        # richer CLIP features are used for policy; d0 (im_channels) is only
-        # needed for the GS renderer.
-        vox_ds     = F.adaptive_avg_pool3d(d0_emb, (ds, ds, ds))    # (B, _vox_in_C, ds,ds,ds)
-        vox_tokens = rearrange(vox_ds, 'b c x y z -> b (x y z) c')  # (B, N, _vox_in_C)
+        vox_ds     = F.adaptive_avg_pool3d(d0, (ds, ds, ds))        # (B, im_channels, ds,ds,ds)
+        vox_tokens = rearrange(vox_ds, 'b c x y z -> b (x y z) c')  # (B, N, im_channels)
 
         # Project to embedding_dim
         vox_tokens  = self.voxel_token_proj(vox_tokens)    # (B, N, emb)
@@ -1086,6 +1139,11 @@ class VoxelFlowEncoder(nn.Module):
 
         # Add learned absolute positional encoding
         vox_tokens = vox_tokens + self.voxel_pos_emb(voxel_pos)
+
+        # Save the full (N) token set BEFORE DPS — used by cross_attn in the
+        # transformer head (mirrors reference rgb3d_feats which is never subsampled).
+        full_vox_tokens = vox_tokens   # (B, N, emb)
+        full_vox_pos    = voxel_pos    # (B, N, 3)
 
         # DPS subsampling: reduce N -> M for joint self-attention.
         # DPS works in feature space (not spatial coords), so it naturally
@@ -1125,32 +1183,45 @@ class VoxelFlowEncoder(nn.Module):
         if gripper_pose is not None:
             gripper_xyz = gripper_pose[:, :3].float().to(device)    # (B, 3)
         elif pcd is not None:
-            # pcd: (B, 3, H, W) — mean over spatial dims → (B, 3) approx centre
-            gripper_xyz = pcd.float().to(device).flatten(2).mean(dim=2)  # (B, 3)
+            # pcd may be a list of (B, 3, H, W) tensors (multi-camera) or a
+            # single (B, 3, H, W) tensor.  Take the first camera as a proxy for
+            # approximate workspace centre when no gripper_pose is available.
+            pcd_first = pcd[0] if isinstance(pcd, (list, tuple)) else pcd
+            gripper_xyz = pcd_first.float().to(device).flatten(2).mean(dim=2)  # (B, 3)
         else:
             gripper_xyz = torch.zeros(B, 3, device=device, dtype=torch.float32)
         gripper_pos = self.relative_pe_layer(
             gripper_xyz.unsqueeze(1)                            # (B, 1, 3)
         )                                                       # (B, 1, emb, 2) RoPE
 
-        # Scene token 3D RoPE positions
+        # Scene token 3D RoPE positions (fps subset — for self_attn in transformer head)
         scene_pos = self.relative_pe_layer(fps_pos)             # (B, M, emb, 2)
 
-        # 3-layer cross-attention: gripper → scene
+        # Full-N token 3D RoPE positions (for cross_attn in transformer head AND
+        # gripper_context_head — mirrors reference encode_proprio which attends
+        # to rgb3d_feats (full N), not the DPS-subsampled set).
+        full_scene_pos = self.relative_pe_layer(full_vox_pos)   # (B, N, emb, 2)
+
+        # 3-layer cross-attention: gripper → full scene (mirrors reference encode_proprio
+        # which uses rgb3d_feats (full N) as context, never fps_scene_feats).
         gripper_feats = self.gripper_context_head(
             seq1=gripper_feats,
-            seq2=fps_tokens,
+            seq2=full_vox_tokens,
             seq1_pos=gripper_pos,
-            seq2_pos=scene_pos,
+            seq2_pos=full_scene_pos,
         )[-1]                                                    # (B, 1, emb)
 
         proprio_feats = gripper_feats.squeeze(1)                 # (B, emb)
 
         context = {
-            'voxel_tokens':  fps_tokens,
-            'voxel_pos':     fps_pos,
-            'lang_tokens':   lang_tokens,
-            'proprio_feats': proprio_feats,
+            'voxel_tokens':      fps_tokens,
+            'voxel_pos':         fps_pos,
+            'rel_vox_pos':       scene_pos,        # pre-computed 3D RoPE for fps_tokens
+            'full_vox_tokens':   full_vox_tokens,  # (B, N, emb) — full set for cross_attn
+            'full_vox_pos':      full_vox_pos,      # (B, N, 3)  — world coords for full set
+            'rel_full_vox_pos':  full_scene_pos,   # (B, N, emb, 2) — RoPE for full set
+            'lang_tokens':       lang_tokens,
+            'proprio_feats':     proprio_feats,
         }
         return d0, l, context
 
@@ -1172,27 +1243,53 @@ class VoxelFlowEncoder(nn.Module):
             [..., 3:9] rotation velocity (ortho6D)
             [..., 9:]  gripper logit
         """
-        if isinstance(context, dict):
-            voxel_tokens  = context['voxel_tokens']
-            voxel_pos     = context['voxel_pos']
-            lang_tokens   = context['lang_tokens']
-            proprio_feats = context.get('proprio_feats', None)
-        else:
-            B = noisy_trajectory.shape[0]
-            device = noisy_trajectory.device
-            voxel_tokens  = torch.zeros(B, 1, self.embedding_dim, device=device)
-            voxel_pos     = torch.zeros(B, 1, 3, device=device)
-            lang_tokens   = torch.zeros(B, 1, self.embedding_dim, device=device)
-            proprio_feats = None
+        try:
+            voxel_tokens     = context['voxel_tokens']
+            voxel_pos        = context['voxel_pos']
+            rel_vox_pos      = context.get('rel_vox_pos', None)
+            full_vox_tokens  = context.get('full_vox_tokens', None)
+            full_vox_pos     = context.get('full_vox_pos', None)
+            rel_full_vox_pos = context.get('rel_full_vox_pos', None)
+            lang_tokens      = context['lang_tokens']
+            proprio_feats    = context.get('proprio_feats', None)
+        except KeyError as e:
+            missing_key = e.args[0]
+            raise KeyError(
+                f"Missing key '{missing_key}' in context dict.  "
+                f"Available keys: {list(context.keys())}"
+            ) from None
+        # Compute 3D RoPE for voxel tokens using the shared relative_pe_layer
+        # (same weights used in gripper_context_head → spatially coherent).
+        if rel_vox_pos is None:
+            rel_vox_pos = self.relative_pe_layer(voxel_pos.float())   # (B, M, emb, 2)
+
+        # Fallback: if full tokens weren't stored in context (e.g. old checkpoint
+        # or no-DPS path), degrade gracefully to fps tokens for cross_attn.
+        if full_vox_tokens is None:
+            full_vox_tokens  = voxel_tokens
+            rel_full_vox_pos = rel_vox_pos
+        elif rel_full_vox_pos is None:
+            # full_vox_pos must be present when full_vox_tokens is present
+            _full_pos = full_vox_pos if full_vox_pos is not None else voxel_pos
+            rel_full_vox_pos = self.relative_pe_layer(_full_pos.float())
+
+        # Compute 3D RoPE for trajectory positions (unnormalise from [-1,1] first).
+        traj_xyz_norm = noisy_trajectory[:, :, :3].float()             # (B, T, 3) in [-1,1]
+        ws_min = self.coord_bounds[:3].to(traj_xyz_norm.device)
+        ws_max = self.coord_bounds[3:].to(traj_xyz_norm.device)
+        traj_xyz = (traj_xyz_norm + 1.0) / 2.0 * (ws_max - ws_min) + ws_min
+        rel_traj_pos = self.relative_pe_layer(traj_xyz)                # (B, T, emb, 2)
 
         return self.transformer_head(
             noisy_trajectory=noisy_trajectory.float(),
             timestep=t.float(),
-            voxel_tokens=voxel_tokens.float(),
-            voxel_pos=voxel_pos.float(),
+            fps_vox_tokens=voxel_tokens.float(),
+            rel_fps_vox_pos=rel_vox_pos,
+            full_vox_tokens=full_vox_tokens.float(),
+            rel_full_vox_pos=rel_full_vox_pos,
+            rel_traj_pos=rel_traj_pos,
             lang_tokens=lang_tokens.float(),
             proprio_feats=proprio_feats.float() if proprio_feats is not None else None,
-            coord_bounds=self.coord_bounds,   # pass workspace bounds for RoPE unnormalization
         )
 
     # ---------------------------------------------------------------------- #

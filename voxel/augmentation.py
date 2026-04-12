@@ -514,6 +514,8 @@ def apply_se3_augmentation_continuous(
 
     # Convert aug_rot back to quaternion: pytorch3d returns wxyz, action layout needs xyzw
     aug_quat_wxyz = torch3d_tf.matrix_to_quaternion(aug_rot)                   # (B, 4) wxyz
+    # Re-normalise to guard against numerical drift in matrix_to_quaternion
+    aug_quat_wxyz = aug_quat_wxyz / (aug_quat_wxyz.norm(dim=-1, keepdim=True) + 1e-8)
     aug_quat_xyzw = torch.cat(
         [aug_quat_wxyz[:, 1:], aug_quat_wxyz[:, 0:1]], dim=1
     )                                                                           # (B, 4) xyzw
@@ -553,6 +555,10 @@ def apply_se3_augmentation_continuous(
 
         aug_obs_rot = torch.bmm(rot_shift_3x3_T, obs_grip_rot)                 # (B, 3, 3)
         aug_obs_quat_wxyz = torch3d_tf.matrix_to_quaternion(aug_obs_rot)       # (B, 4) wxyz
+        # Re-normalise to guard against numerical drift
+        aug_obs_quat_wxyz = aug_obs_quat_wxyz / (
+            aug_obs_quat_wxyz.norm(dim=-1, keepdim=True) + 1e-8
+        )
         aug_obs_quat_xyzw = torch.cat(
             [aug_obs_quat_wxyz[:, 1:], aug_obs_quat_wxyz[:, 0:1]], dim=1
         )                                                                       # (B, 4) xyzw

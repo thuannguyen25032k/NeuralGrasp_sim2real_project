@@ -38,21 +38,10 @@ log_file="${log_dir}/${exp_name}_$(date +%Y%m%d_%H%M%S).log"
 echo "Log file: ${log_file}"
 
 # ---- Hyperparameters -------------------------------------------------------
-batch_size=4
+batch_size=8
 tasks=[put_money_in_safe]   # single-task baseline; change to multi-task list when demos are ready
 demo=100                     # use all available demos (was 20 → 5× more training data)
 
-# Flow-matching specific
-denoise_timesteps=100
-lv2_batch_size=4             # sample 4 noise levels per step → lower gradient variance (was 1)
-flow_context_dim=256
-flow_hidden_dim=512
-flow_num_layers=4
-# ----------------------------------------------------------------------------
-# Flow-matching head
-action_chunk_size=1
-lv2_batch_size=1
-embedding_dim=256    # 120→~2M params (too small); 192→~6M; 256→~14M
 
 # Optimizer — reference 3D FlowMatch Actor: Adam lr=1e-4, constant schedule.
 # LAMB + lr=0.005 (PerAct defaults) is 50× too high for a flow-matching
@@ -86,16 +75,9 @@ train_cmd=(
     "rlbench.demos=${demo}"
     # ---- Disable neural rendering ------------------------------------------
     "method.use_neural_rendering=False"
-    "method.neural_renderer.foundation_model_name=diffusion"   # keep the foundation model for flow-matching features, but disable the NeRF loss by not rendering any RGB frames
-    # ---- Flow-matching settings --------------------------------------------
-    "method.denoise_timesteps=${denoise_timesteps}"
-    "method.action_chunk_size=${action_chunk_size}"
-    "method.lv2_batch_size=${lv2_batch_size}"
-    "method.embedding_dim=${embedding_dim}"
-    "method.denoise_timesteps=${denoise_timesteps}"
-    "method.flow_context_dim=${flow_context_dim}"
-    "method.flow_hidden_dim=${flow_hidden_dim}"
-    "method.flow_num_layers=${flow_num_layers}"
+    # foundation_model_name=diffusion is the YAML default (matches training
+    # checkpoints); kept explicit here for clarity.
+    "method.neural_renderer.foundation_model_name=diffusion"
     # ---- Optimizer (must match reference: Adam + constant lr=1e-4) ---------
     "method.lr=${lr}"
     "method.optimizer=${optimizer}"

@@ -79,10 +79,14 @@ class FFWLayer(DummyLayer):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x, ada_sgnl=None):
-        residual = x
+        # Matches reference FFWLayer exactly (base_denoise_actor/modeling/utils/layers.py):
+        #   x = norm(x)         → no-op when pre_norm=False
+        #   x = adaln(x)        → AdaLN modulates x IN-PLACE (becomes new "base")
+        #   x = x + ffn(x)      → residual is adaln(x), not original x
+        #   x = norm(x)         → post-norm when pre_norm=False
         x = self._norm(x, self.norm, self.pre_norm)
-        x_modulated = self._adaln(x, self.adaln, ada_sgnl)
-        x = residual + self.ffn(x_modulated)
+        x = self._adaln(x, self.adaln, ada_sgnl)
+        x = x + self.ffn(x)
         x = self._norm(x, self.norm, not self.pre_norm)
         return x
 
@@ -114,8 +118,8 @@ class AttentionLayer(DummyLayer):
         else:
             k2 = v2 = self._norm(seq2, self.norm_kv, self.pre_norm)
         if not self.rotary_pe:
-            q1 = self.with_pos_embed(seq1, seq1_pos)
-            k2 = self.with_pos_embed(seq2, seq2_pos)
+            q1 = self.with_pos_embed(seq1, seq1_pos)   # matches reference: pos added to un-normed seq1
+            k2 = self.with_pos_embed(seq2, seq2_pos)   # matches reference: pos added to un-normed seq2
         q1 = self.with_pos_embed(q1, seq1_sem_pos)
         k2 = self.with_pos_embed(k2, seq2_sem_pos)
         q1 = self._adaln(q1, self.adaln, ada_sgnl)
