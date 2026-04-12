@@ -21,7 +21,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
 
 # matplotlib internally uses an old pyparsing API that emits
 # PyparsingDeprecationWarning on every import.  Suppress once at module load.
@@ -35,20 +34,16 @@ with warnings.catch_warnings():
 
 from yarr.agents.agent import Agent, ActResult, ScalarSummary, \
     HistogramSummary, ImageSummary, Summary
-from termcolor import colored, cprint
+from termcolor import cprint
 import io
 
-from helpers.utils import visualise_voxel
 from voxel.voxel_grid import VoxelGrid
 from voxel.augmentation import apply_se3_augmentation_continuous
-from helpers.clip.core.clip import build_model, load_clip
 import PIL.Image as Image
 import transformers
 from helpers.optim.lamb import Lamb
-from torch.nn.parallel import DistributedDataParallel as DDP
 from agents.maniflow_bc.neural_rendering import NeuralRenderer
 from agents.maniflow_bc.utils import (
-    visualize_pcd,
     quat_xyzw_to_ortho6d,
     ortho6d_to_quat_xyzw,
 )
@@ -219,16 +214,27 @@ class QFunctionFlow(nn.Module):
 
         # Pad bounds if necessary to ensure consistent shape for flow encoder
         if bounds.shape[0] != b:
-            bounds = bounds.repeat(b, 1)
+            # bounds is (1, 6) from the global coordinate_bounds — broadcast to batch.
+            # Use expand (zero-copy view) rather than repeat (allocates memory) and
+            # guard against the case where bounds already has the correct batch size.
+            if bounds.shape[0] == 1:
+                bounds = bounds.expand(b, -1)
+            else:
+                bounds = bounds[:b] if bounds.shape[0] > b else bounds.repeat(
+                    (b + bounds.shape[0] - 1) // bounds.shape[0], 1
+                )[:b]
 
         # When the CLIP backbone is active, pass the raw 2D RGB and point
         # cloud of the first (front) camera directly to the encoder.
         # The voxel_grid is still built above (needed by the GS renderer).
         enc = getattr(self._flow_encoder, 'module', self._flow_encoder)
         if enc.use_clip_backbone:
-            # Use first camera's RGB (B, 3, H, W) and PCD (B, 3, H, W)
-            rgb_2d = rgb[0]    # (B, 3, H, W) — ManiFlow normalised [-1,1]
-            pcd_2d = pcd[0]    # (B, 3, H, W) — world XYZ per pixel
+            # Pass ALL cameras' RGB (B, 3, H, W) and PCD (B, 3, H, W) to the
+            # CLIP lifter so its scatter-add covers the full workspace, matching
+            # the multi-camera voxel grid built above from all cameras' pcd_flat.
+            # CLIPVoxelLifter.forward() accepts lists and averages across cameras.
+            rgb_2d = rgb          # list of (B, 3, H, W) per camera
+            pcd_2d = pcd          # list of (B, 3, H, W) per camera
         else:
             rgb_2d = None
             pcd_2d = None
@@ -534,9 +540,9 @@ class ManiFlowBCAgent(Agent):
             [grid_for_crop.transpose(1, 0), grid_for_crop], dim=2
         ).unsqueeze(0)
 
-        self._coordinate_bounds = torch.tensor(
-            self._coordinate_bounds, device=device
-        ).unsqueeze(0)
+        self._coordinate_bounds = torch.as_tensor(
+            self._coordinate_bounds, dtype=torch.float32, device=device
+        ).reshape(1, 6)
 
         if training:
             if self._optimizer_type == 'lamb':
@@ -621,7 +627,9 @@ class ManiFlowBCAgent(Agent):
         for n in self._camera_names:
             obs.append([observation['%s_rgb' % n],
                         observation['%s_point_cloud' % n]])
-            depths.append(observation['%s_depth' % n])
+            # depth is collected for API compatibility but not used by
+            # encode_scene — guard against eval envs that omit it.
+            depths.append(observation.get('%s_depth' % n, None))
             pcds.append(observation['%s_point_cloud' % n])
             exs.append(observation['%s_camera_extrinsics' % n].squeeze(0))
             ins.append(observation['%s_camera_intrinsics' % n].squeeze(0))
@@ -714,8 +722,16 @@ class ManiFlowBCAgent(Agent):
             pred_list = self._encoder.predict_velocity(noisy_traj, timesteps, context)
 
             # RF target: v* = noise − x_clean
-            denoise_target = self._pos_scheduler.prepare_target(
-                noise, gt_trajectory)             # (B, T, nhand, 9)
+            # Compute targets for pos and rot separately so that if the two
+            # schedulers ever diverge in their `prepare_target` formula, each
+            # component uses the correct formula.
+            denoise_target_pos = self._pos_scheduler.prepare_target(
+                noise[..., :3], gt_trajectory[..., :3])   # (B, T, nhand, 3)
+            denoise_target_rot = self._rot_scheduler.prepare_target(
+                noise[..., 3:], gt_trajectory[..., 3:])   # (B, T, nhand, 6)
+            denoise_target = torch.cat(
+                [denoise_target_pos, denoise_target_rot], dim=-1
+            )   # (B, T, nhand, 9)
 
             for layer_pred in pred_list:
                 # Unflatten back to (B, T, nhand, 10)
@@ -732,7 +748,8 @@ class ManiFlowBCAgent(Agent):
                 )
                 total_loss = total_loss + iter_loss
 
-        total_loss = total_loss / self._lv2_batch_size
+        num_predictions = len(pred_list)   # 1 normally; >1 if deep-supervision is added
+        total_loss = total_loss / (self._lv2_batch_size * num_predictions)
 
         # Individual losses from last inner iteration / last layer for logging
         lp_last = pred_list[-1].unflatten(1, (T, nhand))
@@ -788,6 +805,12 @@ class ManiFlowBCAgent(Agent):
             rot = self._rot_scheduler.step(
                 out[..., 3:9], idx, trajectory[..., 3:9]).prev_sample
             trajectory = torch.cat([pos, rot], dim=-1)   # (B, T*nhand, 9)
+
+        if out is None:
+            raise RuntimeError(
+                f"_denoise_action: denoising loop did not execute "
+                f"(steps={steps}). Ensure denoise_timesteps > 0."
+            )
 
         # Unflatten nhand dimension, then post-process
         trajectory = trajectory.unflatten(1, (T, nhand))  # (B, T, nhand, 9)
@@ -1197,7 +1220,7 @@ class ManiFlowBCAgent(Agent):
 
         # Move to device
         obs    = [[o[0][0].to(self._device), o[1][0].to(self._device)] for o in obs]
-        depth  = [d[0].to(self._device) for d in depth]
+        depth  = [d[0].to(self._device) if d is not None else None for d in depth]
         # observation['low_dim_state'] arrives from YARR as (1, timesteps, 4).
         # Strip the timestep dimension (dim-1) to match the training shape (B, 4),
         # mirroring PreprocessAgent._strip_time's `v[:, 0]` in the replay path.
@@ -1226,7 +1249,7 @@ class ManiFlowBCAgent(Agent):
         obs_gripper_pose_act = observation.get('obs_gripper_pose', None)
         if obs_gripper_pose_act is not None:
             obs_gripper_pose_act = torch.as_tensor(
-                np.array(obs_gripper_pose_act), dtype=torch.float32,
+                obs_gripper_pose_act, dtype=torch.float32,
                 device=self._device,
             )
             # Strip leading batch/timestep dims added by YARR rollout_generator
@@ -1327,13 +1350,30 @@ class ManiFlowBCAgent(Agent):
             # checkpoint (batch_size=8) into an eval model (batch_size=1).
             if '_voxelizer' in k:
                 continue
+            # ------------------------------------------------------------------
+            # Backward-compatibility: checkpoints saved before the proprio_proj
+            # refactor stored it as nn.Sequential (keys: 'proprio_proj.0.weight'
+            # / 'proprio_proj.0.bias').  The current code uses a bare nn.Linear
+            # (keys: 'proprio_proj.weight' / 'proprio_proj.bias').  Remap old
+            # Sequential keys so the weights are not silently discarded.
+            # ------------------------------------------------------------------
+            k = k.replace('proprio_proj.0.weight', 'proprio_proj.weight')
+            k = k.replace('proprio_proj.0.bias',   'proprio_proj.bias')
             if k in merged:
-                merged[k] = v
+                if merged[k].shape != v.shape:
+                    cprint(
+                        f"[load_weights] shape mismatch for '{k}': "
+                        f"ckpt={tuple(v.shape)}, model={tuple(merged[k].shape)}. "
+                        f"Key will NOT be loaded — check embedding_dim / arch config.",
+                        'red',
+                    )
+                else:
+                    merged[k] = v
             else:
                 logging.warning(f"key {k} in checkpoint but not in model.")
         msg = self._q.load_state_dict(merged, strict=False)
         if msg.missing_keys:
-            cprint(f"missing keys: {msg.missing_keys}", 'yellow')
+            cprint(f"[load_weights] missing keys (random init): {msg.missing_keys}", 'yellow')
         cprint(f"Loaded weights from {weight_file}", 'cyan')
 
     def save_weights(self, savedir: str):

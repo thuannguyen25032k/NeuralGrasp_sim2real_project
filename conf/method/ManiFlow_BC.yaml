@@ -3,7 +3,7 @@ name: 'ManiFlow_BC'
 
 use_fabric: True
 
-use_depth: True
+use_depth: False  # depth is fully redundant: point_cloud already encodes XYZ in world space
 use_neural_rendering: True
 num_view_for_nerf: 20
 
@@ -53,6 +53,9 @@ action_dim: 8             # [x, y, z, qx, qy, qz, qw, gripper]
 #   Larger = more capacity, higher memory/compute cost.
 #   120 → ~2M params (too small); 192 → ~6M; 256 → ~14M (matches typical
 #   3D FlowMatch Actor scale for single-task learning).
+#   NOTE: existing checkpoints were trained with 120. Change only when
+#   starting a fresh training run — mismatching causes all transformer
+#   weights to be silently dropped at eval (shape mismatch → random init).
 embedding_dim: 120
 
 # num_attn_heads: number of attention heads in every AttentionModule.
@@ -60,6 +63,7 @@ embedding_dim: 120
 #   120 / 8 = 15 (good); 192 / 8 = 24; 256 / 8 = 32.
 #   120 matches the reference 3D FlowMatch Actor default and regularises
 #   better with small datasets (20 demos).
+#   NOTE: keep in sync with checkpoints — existing checkpoints use 120/8.
 num_attn_heads: 8
 
 # num_shared_attn_layers: depth of the joint action+voxel self-attention
@@ -88,7 +92,7 @@ num_fps_tokens: 512
 #
 # finetune_clip_backbone: allow gradients through the CLIP ResNet50.
 #   Keep False (frozen) for 20-demo training to avoid overfitting.
-use_clip_backbone: True
+use_clip_backbone: False
 finetune_clip_backbone: False
 
 # denoise_timesteps: number of rectified-flow denoising steps at inference.
