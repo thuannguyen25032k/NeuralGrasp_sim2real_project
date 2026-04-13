@@ -22,7 +22,7 @@ seed="0"
 train_gpu=${1:-"0"}
 train_gpu_list=(${train_gpu//,/ })
 port=${2:-"12346"}
-use_wandb=True          # off by default — flip to True when you want W&B logs
+use_wandb=True
 
 cur_dir=$(pwd)
 train_demo_path="${cur_dir}/data/train_data"
@@ -38,10 +38,10 @@ log_file="${log_dir}/${exp_name}_$(date +%Y%m%d_%H%M%S).log"
 echo "Log file: ${log_file}"
 
 # ---- Hyperparameters -------------------------------------------------------
-batch_size=8
-tasks=[put_money_in_safe]   # single-task baseline; change to multi-task list when demos are ready
-demo=100                     # use all available demos (was 20 → 5× more training data)
-
+batch_size=4
+# Single easy task for a quick correctness check — change as needed.
+tasks=[put_money_in_safe]
+demo=100
 
 # Optimizer — reference 3D FlowMatch Actor: Adam lr=1e-4, constant schedule.
 # LAMB + lr=0.005 (PerAct defaults) is 50× too high for a flow-matching
@@ -50,7 +50,11 @@ lr=0.0001
 optimizer=adam
 lr_scheduler=False
 
-# Run for 100K steps (a reasonable check run; reference uses 300K for multi-task)
+# lv2_batch_size: inner noise re-sampling loop — 3 gives 3× gradient diversity
+# with negligible cost (scene encoding is reused).
+lv2_batch_size=3
+
+# Run for 200K steps (a reasonable check run; reference uses 300K for multi-task)
 training_iterations=200010
 save_freq=10000
 # ----------------------------------------------------------------------------
@@ -75,19 +79,13 @@ train_cmd=(
     "rlbench.demos=${demo}"
     # ---- Disable neural rendering ------------------------------------------
     "method.use_neural_rendering=False"
-    # foundation_model_name=diffusion is the YAML default (matches training
-    # checkpoints); kept explicit here for clarity.
-    "method.neural_renderer.foundation_model_name=diffusion"
     # ---- Optimizer (must match reference: Adam + constant lr=1e-4) ---------
     "method.lr=${lr}"
     "method.optimizer=${optimizer}"
     "method.lr_scheduler=${lr_scheduler}"
     "method.num_warmup_steps=0"
-    # ---- Loss weights (matching base_denoise_actor defaults) ---------------
-    "method.pos_loss_weight=30.0"
-    "method.rot_loss_weight=10.0"
-    "method.grip_loss_weight=1.0"
-    "method.lambda_bc=1.0"
+    # ---- Flow-matching hyperparameters -------------------------------------
+    "method.lv2_batch_size=${lv2_batch_size}"
     # ---- Training schedule -------------------------------------------------
     "framework.training_iterations=${training_iterations}"
     "framework.save_freq=${save_freq}"
@@ -97,5 +95,3 @@ echo "Running ManiFlow (no-NeRF) training in foreground." | tee -a "${log_file}"
 echo "CUDA_VISIBLE_DEVICES=${train_gpu} ${train_cmd[*]}" | tee -a "${log_file}"
 
 CUDA_VISIBLE_DEVICES="${train_gpu}" "${train_cmd[@]}" 2>&1 | tee -a "${log_file}"
-
-

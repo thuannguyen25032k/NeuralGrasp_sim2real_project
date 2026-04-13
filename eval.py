@@ -212,7 +212,12 @@ def main(eval_cfg: DictConfig) -> None:
             'zarr_num_workers': eval_cfg.replay.zarr_num_workers if 'replay' in eval_cfg else 4,
             'zarr_mem_gb':     eval_cfg.replay.zarr_mem_gb     if 'replay' in eval_cfg else 8.0,
             'zarr_copies':     eval_cfg.replay.zarr_copies     if 'replay' in eval_cfg else 10,
-        }
+        },
+        # Older train configs lack rlbench.time_in_state (it was under evaluation:).
+        # Default to True so the time token seen at eval matches training.
+        'rlbench': {
+            'time_in_state': True,
+        },
     })
     OmegaConf.set_struct(train_cfg, False)  # allow new keys
     train_cfg = OmegaConf.merge(_replay_defaults, train_cfg)
@@ -234,6 +239,7 @@ def main(eval_cfg: DictConfig) -> None:
                                         eval_cfg.rlbench.camera_resolution,
                                         train_cfg.method.name,
                                         use_depth=train_cfg.method.use_depth,
+                                        use_nerf_multi_view=False,  # no NeRF views at eval time
                                         )
 
     if eval_cfg.cinematic_recorder.enabled:
@@ -262,7 +268,7 @@ def main(eval_cfg: DictConfig) -> None:
                       eval_cfg.rlbench.headless,
                       eval_cfg.framework.eval_episodes,
                       train_cfg.rlbench.include_lang_goal_in_obs,
-                      eval_cfg.rlbench.time_in_state,
+                      train_cfg.rlbench.time_in_state,        # must match training
                       eval_cfg.framework.record_every_n)
     else:
         task = eval_cfg.rlbench.tasks[0]
@@ -279,7 +285,7 @@ def main(eval_cfg: DictConfig) -> None:
                       episode_length,
                       eval_cfg.rlbench.headless,
                       train_cfg.rlbench.include_lang_goal_in_obs,
-                      eval_cfg.rlbench.time_in_state,
+                      train_cfg.rlbench.time_in_state,        # must match training
                       eval_cfg.framework.record_every_n)
 
     logging.info('Evaluating seed %d.' % start_seed)

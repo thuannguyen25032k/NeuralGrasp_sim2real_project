@@ -33,16 +33,12 @@ class ManiFlowStackAgent(Agent):
 
     # ------------------------------------------------------------------
     def update(self, step: int, replay_sample: dict, **kwargs) -> dict:
-        # Only warn about missing NeRF data when neural rendering is actually
-        # enabled; when use_neural_rendering=False the paths are always None.
-        _uses_nerf = any(
-            getattr(qa, 'use_neural_rendering', False)
-            for qa in self._qattention_agents
-        )
-        if _uses_nerf and (
-            replay_sample['nerf_multi_view_rgb'] is None
-            or replay_sample['nerf_multi_view_rgb'][0, 0] is None
-        ):
+        nerf_rgb = replay_sample.get('nerf_multi_view_rgb')
+        try:
+            _no_nerf = nerf_rgb is None or nerf_rgb[0, 0] is None
+        except (TypeError, IndexError, KeyError):
+            _no_nerf = True
+        if _no_nerf:
             cprint("ManiFlowStackAgent: no nerf rgb in sample", "red")
 
         total_losses = 0.
@@ -93,9 +89,7 @@ class ManiFlowStackAgent(Agent):
         # [x, y, z, qx, qy, qz, qw, gripper]
         # Append ignore_collisions (from live observation) to form the 9-DoF
         # action expected by RLBench's action_mode.
-        # observation['ignore_collisions'] is shape (1,) numpy array from YARR.
-        ic_raw = observation['ignore_collisions']
-        ignore_collisions = float(ic_raw.item() if hasattr(ic_raw, 'item') else ic_raw)
+        ignore_collisions = float(observation['ignore_collisions'])
         continuous_action = np.concatenate([
             final_act_results.action,
             [ignore_collisions],

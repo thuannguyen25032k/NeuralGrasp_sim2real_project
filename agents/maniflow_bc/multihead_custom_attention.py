@@ -109,12 +109,16 @@ def multi_head_attention_forward(query,
 
     q, k, v = F._in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
 
-    if rotary_pe is not None:  # rotary pe ROPE disentangeld
+    if rotary_pe is not None:  # rotary pe ROPE disentangled
         qp, kvp = rotary_pe
-        q_cos, q_sin = qp[..., 0], qp[..., 1]
-        k_cos, k_sin = kvp[..., 0], kvp[..., 1]
-        q = RotaryPositionEncoding.embed_rotary(q.transpose(0, 1), q_cos, q_sin).transpose(0, 1)
-        k = RotaryPositionEncoding.embed_rotary(k.transpose(0, 1), k_cos, k_sin).transpose(0, 1)
+        # Either component may be None (e.g. language tokens in cross-attention
+        # have no spatial position), so apply RoPE only where a PE is provided.
+        if qp is not None:
+            q_cos, q_sin = qp[..., 0], qp[..., 1]
+            q = RotaryPositionEncoding.embed_rotary(q.transpose(0, 1), q_cos, q_sin).transpose(0, 1)
+        if kvp is not None:
+            k_cos, k_sin = kvp[..., 0], kvp[..., 1]
+            k = RotaryPositionEncoding.embed_rotary(k.transpose(0, 1), k_cos, k_sin).transpose(0, 1)
 
     q = einops.rearrange(q, "S B (H D) -> B H S D", H=num_heads, D=head_dim)
     k = einops.rearrange(k, "S B (H D) -> B H S D", H=num_heads, D=head_dim)

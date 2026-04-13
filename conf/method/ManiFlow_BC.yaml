@@ -3,9 +3,9 @@ name: 'ManiFlow_BC'
 
 use_fabric: True
 
-use_depth: False  # depth is fully redundant: point_cloud already encodes XYZ in world space
+use_depth: True
 use_neural_rendering: True
-num_view_for_nerf: 20
+num_view_for_nerf: 21
 
 # Language encoder
 # choices: T5 (768), CLIP (512)
@@ -23,7 +23,13 @@ voxel_patch_size: 5
 voxel_patch_stride: 5
 final_dim: 128
 lang_fusion_type: 'seq'   # 'seq' or 'concat'
-
+# --- Transformer head hyperparameters -----------------------------------
+# embedding_dim: feature dimension for all Transformer layers.
+#   Must be divisible by num_attn_heads.
+#   128 / 8 = 16 (head dim too narrow); 192 / 8 = 24 (good balance of
+#   capacity and memory); 256 / 8 = 32 (higher capacity, more memory).
+#   Also avoids the 128→128 no-op projection since final_dim stays at 128.
+embedding_dim: 192
 # -----------------------------------------------------------------------
 # Flow-matching head  (Transformer — mirrors 3D FlowMatch Actor)
 # -----------------------------------------------------------------------
@@ -47,21 +53,9 @@ lang_fusion_type: 'seq'   # 'seq' or 'concat'
 # -----------------------------------------------------------------------
 action_dim: 8             # [x, y, z, qx, qy, qz, qw, gripper]
 
-# --- Transformer head hyperparameters -----------------------------------
-# embedding_dim: feature dimension for all Transformer layers.
-#   Must be divisible by num_attn_heads.
-#   Larger = more capacity, higher memory/compute cost.
-#   120 → ~2M params (too small); 192 → ~6M; 256 → ~14M (matches typical
-#   3D FlowMatch Actor scale for single-task learning).
-#   NOTE: existing checkpoints were trained with 256. Change only when
-#   starting a fresh training run — mismatching causes all transformer
-#   weights to be silently dropped at eval (shape mismatch → random init).
-embedding_dim: 256
-
 # num_attn_heads: number of attention heads in every AttentionModule.
 #   embedding_dim / num_attn_heads = head dimension.
-#   256 / 8 = 32  (current setting — matches all checkpoints in maniflow_run1).
-#   NOTE: keep in sync with embedding_dim and checkpoints.
+#   192 / 8 = 24 (good); 256 / 8 = 32.
 num_attn_heads: 8
 
 # num_shared_attn_layers: depth of the joint action+voxel self-attention
@@ -79,23 +73,11 @@ voxel_token_downsample: 5
 #   Set to 0 to disable FPS and keep all N tokens.
 num_fps_tokens: 512
 
-# -----------------------------------------------------------------------
-# CLIP backbone option (replaces 3D-CNN with CLIP RN50 + feature lifter)
-# -----------------------------------------------------------------------
-# use_clip_backbone: if True, run CLIP RN50 on the raw 2D RGB image and
-#   lift the 2D features into the 3D voxel volume via point-cloud backprojection.
-#   This replaces MultiLayer3DEncoderShallow with CLIPVoxelLifter.
-#   The rest of VoxelFlowEncoder (Transformer head, GS renderer) is unchanged.
-#   Requires rgb and pcd to be passed through QFunctionFlow.encode_scene.
-#
-# finetune_clip_backbone: allow gradients through the CLIP ResNet50.
-#   Keep False (frozen) for 20-demo training to avoid overfitting.
-use_clip_backbone: False
-finetune_clip_backbone: False
-
 # denoise_timesteps: number of rectified-flow denoising steps at inference.
 #   Does not affect training (training uses a single random t ~ U[0,1]).
-denoise_timesteps: 50
+#   Rectified flow follows straight-line trajectories, so 20 steps is
+#   sufficient — 100 steps wastes ~5x inference time with no quality gain.
+denoise_timesteps: 20
 
 # action_chunk_size: number of action steps to predict per denoising call.
 #   T=1  → single next-step prediction (backward-compatible default).
@@ -108,7 +90,7 @@ action_chunk_size: 1
 #   reuses the same encoded scene context — effectively multiplying the
 #   gradient diversity by N without re-running the 3D-CNN encoder.
 #   1 = no inner loop (standard RF loss); 2-4 = recommended for better grad.
-lv2_batch_size: 4
+lv2_batch_size: 3
 
 # workspace_bounds: [x_min, y_min, z_min, x_max, y_max, z_max]
 #   Used to normalise xyz to [-1, 1] before the rectified-flow process.
@@ -123,11 +105,23 @@ flow_context_dim: 256   # ignored
 flow_hidden_dim: 512    # ignored
 flow_num_layers: 4      # ignored
 
-# Flow-matching loss weights (matching base_denoise_actor defaults exactly)
+# Flow-matching loss weights
 # pos_loss_weight=30, grip_loss_weight=1 match the original 3D FlowMatch Actor.
+# rot_loss_weight raised to 20.0 (from 10.0): ortho6D rotation has 6 output
+# dims vs 3 for position, yet was getting only 1/3 the weight — rebalanced.
 pos_loss_weight: 30.0
-rot_loss_weight: 10.0
+rot_loss_weight: 20.0
 grip_loss_weight: 1.0
+
+# FIX #2: gripper threshold used at inference time.
+# BCE training is symmetric around 0.5; using 0.6 caused premature
+# open-gripper failures.  0.5 matches the training prior exactly.
+# Tune upward (e.g. 0.55) if you observe gripper jitter near grasp.
+grip_threshold: 0.5
+
+# FIX #15: EMA decay for model weight averaging at inference.
+# 0.999 matches the 3D FlowMatch Actor reference.  Set to 0.0 to disable.
+ema_decay: 0.999
 
 # -----------------------------------------------------------------------
 # Training
@@ -152,7 +146,7 @@ lambda_bc: 1.0
 crop_augmentation: True
 transform_augmentation:
   apply_se3: True
-  aug_xyz: [0.125, 0.125, 0.125]
+  aug_xyz: [0.05, 0.05, 0.05]
   aug_rpy: [0.0, 0.0, 45.0]
   aug_rot_resolution: 5     # kept for SE3 augmentation utility
 
@@ -193,7 +187,7 @@ neural_renderer:
   #   Old: 0.01 × 0.01 = 0.0001  (negligible — embed never trained).
   #   New: 0.02 × 0.5  = 0.01    (10× larger, meaningful signal).
   # -----------------------------------------------------------------------
-  lambda_nerf: 0.02
+  lambda_nerf: 0.04
   lambda_embed: 0.5
   lambda_rgb: 1.0
   lambda_l1: 1.0
@@ -210,7 +204,7 @@ neural_renderer:
     scale: 1.0
     mask_gt_rgb: False
 
-  foundation_model_name: 'diffusion' # 'diffusion' matches maniflow_run1 checkpoints; null disables feature lifting
+  foundation_model_name: null # or 'diffusion' or 'dinov2'
   d_embed: 3
   loss_embed_fn: cosine
 

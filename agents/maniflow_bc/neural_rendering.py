@@ -55,7 +55,14 @@ class NeuralRenderer(nn.Module):
         self.loss_embed_fn = cfg.loss_embed_fn
 
         if self.model_name == "diffusion":
-            from odise.modeling.meta_arch.ldm import LdmFeatureExtractor
+            try:
+                from odise.modeling.meta_arch.ldm import LdmFeatureExtractor
+            except (ImportError, ModuleNotFoundError) as _e:
+                raise ImportError(
+                    f"foundation_model_name='diffusion' requires odise + panopticapi. "
+                    f"Install panopticapi first, or set foundation_model_name=null. "
+                    f"Original error: {_e}"
+                ) from _e
             import torchvision.transforms as T
             self.feature_extractor = LdmFeatureExtractor(
                             encoder_block_indices=(5, 7),
@@ -278,7 +285,7 @@ class NeuralRenderer(nn.Module):
         bs = rgb.shape[0]
 
         data = self.encode_data(
-            rgb=rgb, depth=depth, pcd=pcd, focal=focal, c=c, lang_goal=None, tgt_pose=gt_pose, tgt_intrinsic=gt_intrinsic,
+            rgb=rgb, depth=depth, pcd=pcd, focal=focal, c=c, lang_goal=lang_goal, tgt_pose=gt_pose, tgt_intrinsic=gt_intrinsic,
             dec_fts=dec_fts, lang=language, next_tgt_pose=next_gt_pose, next_tgt_intrinsic=next_gt_intrinsic, 
             action=action, step=step,
         )
@@ -399,22 +406,25 @@ class NeuralRenderer(nn.Module):
         return loss_dict, ret_dict
     
     def pts2render(self, data: dict, bg_color=[0,0,0]):
-        '''use render function in GS'''
+        '''use render function in GS; supports batch_size >= 1 by looping per sample'''
         bs = data['intr'].shape[0]
-        assert bs == 1, "batch size should be 1"
-        i = 0
-        xyz_i = data['xyz_maps'][i, :, :]
-        feature_i = data['sh_maps'][i, :, :, :] # [16384, 4, 3]
-        rot_i = data['rot_maps'][i, :, :]
-        scale_i = data['scale_maps'][i, :, :]
-        opacity_i = data['opacity_maps'][i, :, :]
-        feature_language_i = data['feature_maps'][i, :, :]
+        img_preds = []
+        embed_preds = []
+        for i in range(bs):
+            xyz_i = data['xyz_maps'][i, :, :]
+            feature_i = data['sh_maps'][i, :, :, :]  # [N, 4, 3]
+            rot_i = data['rot_maps'][i, :, :]
+            scale_i = data['scale_maps'][i, :, :]
+            opacity_i = data['opacity_maps'][i, :, :]
+            feature_language_i = data['feature_maps'][i, :, :]
 
-        render_return_dict = render(
-            data, i, xyz_i, rot_i, scale_i, opacity_i, 
-            bg_color=bg_color, pts_rgb=None, features_color=feature_i, features_language=feature_language_i
+            render_return_dict = render(
+                data, i, xyz_i, rot_i, scale_i, opacity_i,
+                bg_color=bg_color, pts_rgb=None, features_color=feature_i, features_language=feature_language_i
             )
+            img_preds.append(render_return_dict['render'])          # [3, H, W]
+            embed_preds.append(render_return_dict['render_embed'])  # [d, H, W]
 
-        data['novel_view']['img_pred'] = render_return_dict['render'].unsqueeze(0)
-        data['novel_view']['embed_pred'] = render_return_dict['render_embed'].unsqueeze(0)
+        data['novel_view']['img_pred'] = torch.stack(img_preds, dim=0)    # [B, 3, H, W]
+        data['novel_view']['embed_pred'] = torch.stack(embed_preds, dim=0)  # [B, d, H, W]
         return data

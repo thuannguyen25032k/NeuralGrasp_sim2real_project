@@ -197,6 +197,7 @@ def run_seed(
     else:
         raise ValueError('Method %s does not exists.' % cfg.method.name)
 
+    # All methods use the YARR replay buffer.
     wrapped_replay = PyTorchReplayBuffer(replay_buffer, num_workers=cfg.framework.num_workers)
 
     cwd = os.getcwd()

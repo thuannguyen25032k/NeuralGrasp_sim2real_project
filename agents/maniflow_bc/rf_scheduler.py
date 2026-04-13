@@ -31,11 +31,39 @@ class RFScheduler:
     # Inference setup
     # ------------------------------------------------------------------
     def set_timesteps(self, num_inference_steps: int, device: str = "cpu"):
-        """Build a uniform grid of timesteps in (0, 1] descending."""
-        self.timesteps = torch.from_numpy(
-            np.arange(num_inference_steps + 1)[1:][::-1].astype(np.float32)
-            / num_inference_steps
-        ).to(device)
+        """Build a timestep grid in (0, 1] descending.
+
+        FIX #5: When the sampler is 'logit_normal', use a logit-normal-warped
+        grid rather than a uniform one.  During training, timesteps are drawn
+        from logit-normal(mean, std), which concentrates mass around the
+        midpoint of [0, 1].  A uniform inference grid therefore over-spends
+        steps near t=0 and t=1 (where the velocity field is nearly zero) and
+        under-spends near t=0.5 (where most of the trajectory curvature is).
+        Warping the grid to match the training distribution halves the number
+        of steps needed for the same trajectory quality.
+
+        For 'uniform' and 'pi0' samplers the grid stays uniform (unchanged).
+        """
+        if self.noise_sampler == "logit_normal":
+            mean = self.noise_sampler_config.get("mean", 0.0)
+            std  = self.noise_sampler_config.get("std",  1.5)
+            # Map a uniform grid through the logistic CDF to get a grid whose
+            # density matches the logit-normal training distribution.
+            # u ∈ (0, 1) linearly, then t = sigmoid(u_logit * std + mean)
+            u = np.linspace(0.0, 1.0, num_inference_steps + 2)[1:-1]  # open interval
+            u_logit = np.log(u / (1.0 - u + 1e-8))                    # logit transform
+            t_warped = 1.0 / (1.0 + np.exp(-(u_logit * std + mean)))  # sigmoid back
+            t_warped = np.clip(t_warped, 1e-4, 1.0 - 1e-4)
+            # Sort descending (t=1 is pure noise, t=0 is clean)
+            timesteps_np = np.sort(t_warped)[::-1].astype(np.float32)
+        else:
+            # Original uniform grid for other samplers
+            timesteps_np = (
+                np.arange(num_inference_steps + 1)[1:][::-1].astype(np.float32)
+                / num_inference_steps
+            )
+
+        self.timesteps = torch.from_numpy(timesteps_np.copy()).to(device)
         # prev_t[i] = timesteps[i+1], with prev_t[-1] = 0
         self.prev_timesteps = torch.cat((
             self.timesteps[1:],

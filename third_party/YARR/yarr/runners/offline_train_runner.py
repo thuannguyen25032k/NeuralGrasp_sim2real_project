@@ -71,14 +71,7 @@ class OfflineTrainRunner():
         self._rank = rank
         self._world_size = world_size
         self._fabric = fabric
-        # Whether the method uses neural rendering — when False, missing NeRF
-        # paths in the replay are expected and preprocess_data must not skip them.
-        self._use_neural_rendering = (
-            cfg.method.use_neural_rendering
-            if cfg is not None and hasattr(cfg, 'method') and hasattr(cfg.method, 'use_neural_rendering')
-            else True
-        )
-
+        
         self.tqdm_mininterval = cfg.framework.tqdm_mininterval
         self.use_wandb = cfg.framework.use_wandb
 
@@ -129,47 +122,40 @@ class OfflineTrainRunner():
             return starting_epoch
 
     def preprocess_data(self, data_iter, SILENT=True):
-        """
-        This fucntion takes an iterator and create a batch of data. 
-        """
-        # add main data
-        sampled_batch = next(data_iter) # may raise StopIteration        
+        sampled_batch = next(data_iter)  # may raise StopIteration
+
         batch = {k: v.to(self._train_device) for k, v in sampled_batch.items() if type(v) == torch.Tensor}
 
-        # add nerf data
-        batch['nerf_multi_view_rgb'] = sampled_batch['nerf_multi_view_rgb'] # [bs, 1, 21]
-        batch['nerf_multi_view_depth'] = sampled_batch['nerf_multi_view_depth']
-        batch['nerf_multi_view_camera'] = sampled_batch['nerf_multi_view_camera'] # must!!!
-        batch['lang_goal'] = sampled_batch['lang_goal']
+        # Pass through non-tensor items (lists of strings, numpy object arrays, etc.)
+        for k, v in sampled_batch.items():
+            if k not in batch:
+                batch[k] = v
 
-        # add future nerf data
-        if 'nerf_next_multi_view_rgb' in sampled_batch:
-            batch['nerf_next_multi_view_rgb'] = sampled_batch['nerf_next_multi_view_rgb']
-            batch['nerf_next_multi_view_depth'] = sampled_batch['nerf_next_multi_view_depth']
-            batch['nerf_next_multi_view_camera'] = sampled_batch['nerf_next_multi_view_camera']
-        
-        # squeeze if needed
-        if len(batch['nerf_multi_view_rgb'].shape) == 3:
-            batch['nerf_multi_view_rgb'] = batch['nerf_multi_view_rgb'].squeeze(1)
+        # ---- NeRF multi-view paths (optional — absent in ManiFlow Zarr batches) ----
+        # For YARR-based methods these keys are required; for ManiFlow they may
+        # be numpy object arrays or absent entirely.
+        for nerf_key in ('nerf_multi_view_rgb', 'nerf_multi_view_depth',
+                         'nerf_multi_view_camera', 'lang_goal',
+                         'nerf_next_multi_view_rgb', 'nerf_next_multi_view_depth',
+                         'nerf_next_multi_view_camera'):
+            if nerf_key not in batch:
+                batch[nerf_key] = None
+
+        # squeeze if needed (only when the key is a tensor with shape)
+        nerf_rgb = batch['nerf_multi_view_rgb']
+        if (nerf_rgb is not None
+                and isinstance(nerf_rgb, torch.Tensor)
+                and len(nerf_rgb.shape) == 3):
+            batch['nerf_multi_view_rgb'] = nerf_rgb.squeeze(1)
             batch['nerf_multi_view_depth'] = batch['nerf_multi_view_depth'].squeeze(1)
             batch['nerf_multi_view_camera'] = batch['nerf_multi_view_camera'].squeeze(1)
 
-            if 'nerf_next_multi_view_rgb' in batch and batch['nerf_next_multi_view_rgb'] is not None:
-                batch['nerf_next_multi_view_rgb'] = batch['nerf_next_multi_view_rgb'].squeeze(1)
+            next_rgb = batch.get('nerf_next_multi_view_rgb')
+            if next_rgb is not None and isinstance(next_rgb, torch.Tensor):
+                batch['nerf_next_multi_view_rgb'] = next_rgb.squeeze(1)
                 batch['nerf_next_multi_view_depth'] = batch['nerf_next_multi_view_depth'].squeeze(1)
                 batch['nerf_next_multi_view_camera'] = batch['nerf_next_multi_view_camera'].squeeze(1)
-        
-        # process again if no nerf data
-        # Only skip batches with missing NeRF data when neural rendering is
-        # actually being used.  When use_neural_rendering=False ALL batches
-        # legitimately have None NeRF paths, so recursing here would loop
-        # forever and cause a RecursionError.
-        if self._use_neural_rendering:
-            if batch['nerf_multi_view_rgb'] is None or batch['nerf_multi_view_rgb'][0,0] is None:
-                if not SILENT:
-                    cprint('batch[nerf_multi_view_rgb] is None. find next data iter', 'red')
-                return self.preprocess_data(data_iter)
-        
+
         return batch
 
     def start(self):

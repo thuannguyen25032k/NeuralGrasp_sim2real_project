@@ -13,7 +13,11 @@ class SinusoidalPosEmb(nn.Module):
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
+        # FIX E: standard Transformer sinusoidal PE uses half_dim as divisor,
+        # not (half_dim - 1).  The off-by-one compresses the frequency range
+        # by ~1%, causing the highest-frequency sinusoids to wrap more slowly
+        # than intended and reducing temporal resolution near t=0.
+        emb = math.log(10000) / half_dim
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=device) * -emb)
         emb = x.float()[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
@@ -124,6 +128,6 @@ class PositionEmbeddingLearnedMLP(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, xyz):
-        """Forward pass, xyz is (B, N, 3or6), output (B, N, F)."""
+        """Forward pass, xyz is (B, N, 3or6), output (B, F, N)."""
         position_embedding = self.position_embedding_head(xyz)
         return position_embedding

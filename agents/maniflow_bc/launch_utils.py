@@ -11,6 +11,7 @@ Mirrors agents/manigaussian_bc/launch_utils.py but:
 """
 
 import logging
+import random
 from typing import List
 
 import numpy as np
@@ -26,6 +27,7 @@ from yarr.replay_buffer.uniform_replay_buffer_single_process import UniformRepla
 
 from helpers import demo_loading_utils, utils
 from helpers.preprocess_agent import PreprocessAgent
+from helpers.clip.core.clip import tokenize
 from helpers.language_model import create_language_model
 
 from agents.maniflow_bc.voxel_flow_encoder import VoxelFlowEncoder
@@ -104,8 +106,6 @@ def create_replay(batch_size: int, timesteps: int,
                       (ignore_collisions_size,),           np.float32),
         ReplayElement('gripper_pose',
                       (gripper_pose_size,),               np.float32),
-        ReplayElement('obs_gripper_pose',
-                      (gripper_pose_size,),               np.float32),   # current obs pose for scene encoder
         ReplayElement('lang_goal_emb',       (lang_feat_dim,
                                               ),                   np.float32),
         ReplayElement('lang_token_embs',
@@ -223,8 +223,7 @@ def _add_keypoints_to_replay(
 
         others = {'demo': True}
         final_obs = {
-            'gripper_pose':      obs_tp1.gripper_pose,   # target pose (action GT)
-            'obs_gripper_pose':  obs.gripper_pose,        # current obs pose (for scene encoder)
+            'gripper_pose':      obs_tp1.gripper_pose,
             'task':              task,
             'lang_goal':         np.array([description], dtype=object),
         }
@@ -250,10 +249,6 @@ def _add_keypoints_to_replay(
     obs_dict_tp1['lang_goal'] = np.array([description], dtype=object)
     obs_dict_tp1.pop('wrist_world_to_cam', None)
     obs_dict_tp1.update(final_obs)
-    # For the terminal state obs_tp1 IS the current obs, so its own gripper
-    # pose is the correct 'obs_gripper_pose' (not the previous obs's pose
-    # that was captured in final_obs before 'obs = obs_tp1' at end of loop).
-    obs_dict_tp1['obs_gripper_pose'] = obs_tp1.gripper_pose
     replay.add_final(**obs_dict_tp1)
 
 
@@ -408,7 +403,7 @@ def create_agent(cfg: DictConfig) -> PreprocessAgent:
     cam_resolution = cfg.rlbench.camera_resolution
 
     # Transformer head hyperparameters (read from cfg, fall back to defaults)
-    embedding_dim = getattr(cfg.method, 'embedding_dim',          120)
+    embedding_dim = getattr(cfg.method, 'embedding_dim',          128)
     num_attn_heads = getattr(cfg.method, 'num_attn_heads',         8)
     num_shared_attn_layers = getattr(cfg.method, 'num_shared_attn_layers', 4)
     voxel_token_downsample = getattr(cfg.method, 'voxel_token_downsample', 5)
@@ -419,8 +414,6 @@ def create_agent(cfg: DictConfig) -> PreprocessAgent:
     lv2_batch_size = getattr(cfg.method, 'lv2_batch_size', 1)
     workspace_bounds = list(getattr(cfg.method, 'workspace_bounds',
                                     list(depth_0bounds)))
-    use_clip_backbone = getattr(cfg.method, 'use_clip_backbone', False)
-    finetune_clip_backbone = getattr(cfg.method, 'finetune_clip_backbone', False)
     # Legacy stubs (ignored by new VoxelFlowEncoder but kept for YAML compat)
     flow_context_dim = getattr(cfg.method, 'flow_context_dim',  256)
     flow_hidden_dim = getattr(cfg.method, 'flow_hidden_dim',   512)
@@ -442,19 +435,17 @@ def create_agent(cfg: DictConfig) -> PreprocessAgent:
             num_shared_attn_layers=num_shared_attn_layers,
             voxel_token_downsample=voxel_token_downsample,
             num_fps_tokens=num_fps_tokens,
-            coordinate_bounds=list(depth_0bounds),
+            coordinate_bounds=workspace_bounds,
             denoise_timesteps=denoise_timesteps,
             activation=cfg.method.activation,
             lang_fusion_type=cfg.method.lang_fusion_type,
-            use_clip_backbone=use_clip_backbone,
-            finetune_clip_backbone=finetune_clip_backbone,
             # legacy stubs
             context_dim=flow_context_dim,
             flow_hidden_dim=flow_hidden_dim,
             flow_num_layers=flow_num_layers,
             voxel_patch_size=cfg.method.voxel_patch_size,
             voxel_patch_stride=cfg.method.voxel_patch_stride,
-            cfg=cfg,
+            cfg=cfg.method,
         )
 
         qattention_agent = ManiFlowBCAgent(
@@ -489,6 +480,8 @@ def create_agent(cfg: DictConfig) -> PreprocessAgent:
             pos_loss_weight=getattr(cfg.method, 'pos_loss_weight',  30.0),
             rot_loss_weight=getattr(cfg.method, 'rot_loss_weight',  10.0),
             grip_loss_weight=getattr(cfg.method, 'grip_loss_weight',  1.0),
+            # FIX #2: pass configurable gripper threshold (default 0.5)
+            grip_threshold=getattr(cfg.method, 'grip_threshold', 0.5),
             cfg=cfg.method,
         )
         qattention_agents.append(qattention_agent)
