@@ -193,7 +193,6 @@ def main(eval_cfg: DictConfig) -> None:
     logdir = os.path.join(cwd, 'seed%d' % start_seed)
 
     train_config_path = os.path.join(logdir, 'config.yaml')
-
     if os.path.exists(train_config_path):
         with open(train_config_path, 'r') as f:
             train_cfg = OmegaConf.load(f)
@@ -201,92 +200,121 @@ def main(eval_cfg: DictConfig) -> None:
         raise Exception(f"Missing {train_config_path}")
 
     # ---------------------------------------------------------------------------
-    # Backwards-compatibility: checkpoints saved before the Zarr loader changes
-    # will not have replay.use_zarr_loader (and siblings) in their config.yaml.
-    # Fill in defaults from eval_cfg so nothing crashes during eval.
+    # Backwards-compatibility: older train configs may lack rlbench.time_in_state
+    # (previously stored under evaluation:).  Merge a safe default so eval never
+    # crashes on a checkpoint that pre-dates that field.
     # ---------------------------------------------------------------------------
-    _replay_defaults = OmegaConf.create({
-        'replay': {
-            'use_zarr_loader': False,
-            'zarr_path':       eval_cfg.replay.zarr_path       if 'replay' in eval_cfg else 'data/train_zarr/train.zarr',
-            'zarr_num_workers': eval_cfg.replay.zarr_num_workers if 'replay' in eval_cfg else 4,
-            'zarr_mem_gb':     eval_cfg.replay.zarr_mem_gb     if 'replay' in eval_cfg else 8.0,
-            'zarr_copies':     eval_cfg.replay.zarr_copies     if 'replay' in eval_cfg else 10,
-        },
-        # Older train configs lack rlbench.time_in_state (it was under evaluation:).
-        # Default to True so the time token seen at eval matches training.
-        'rlbench': {
-            'time_in_state': True,
-        },
-    })
-    OmegaConf.set_struct(train_cfg, False)  # allow new keys
-    train_cfg = OmegaConf.merge(_replay_defaults, train_cfg)
+    _defaults = OmegaConf.create({'rlbench': {'time_in_state': True}})
+    OmegaConf.set_struct(train_cfg, False)
+    train_cfg = OmegaConf.merge(_defaults, train_cfg)
     OmegaConf.set_struct(train_cfg, True)
+
+    # ---------------------------------------------------------------------------
+    # Parameters that MUST match training exactly.
+    # All of these are read from the saved train config, not from eval.yaml,
+    # so there is no risk of a train/eval mismatch.
+    # ---------------------------------------------------------------------------
+    episode_length        = train_cfg.rlbench.episode_length      # time-token range
+    time_in_state         = train_cfg.rlbench.time_in_state        # time token on/off
+    include_lang_goal     = train_cfg.rlbench.include_lang_goal_in_obs
+    use_depth             = train_cfg.method.use_depth
+
+    logging.info(
+        f"[eval] Train config: method={train_cfg.method.name}  "
+        f"episode_length={episode_length}  time_in_state={time_in_state}  "
+        f"include_lang_goal={include_lang_goal}  use_depth={use_depth}"
+    )
+
+    # ---------------------------------------------------------------------------
+    # Warn if eval scene_bounds differ from training (would silently corrupt
+    # voxelisation and workspace normalisation).
+    # ---------------------------------------------------------------------------
+    if list(eval_cfg.rlbench.scene_bounds) != list(train_cfg.rlbench.scene_bounds):
+        logging.warning(
+            f"[eval] scene_bounds mismatch! "
+            f"train={list(train_cfg.rlbench.scene_bounds)}  "
+            f"eval={list(eval_cfg.rlbench.scene_bounds)}. "
+            "Using training scene_bounds."
+        )
 
     env_device = utils.get_device(eval_cfg.framework.gpu)
     device_idx = eval_cfg.framework.gpu
-    logging.info('Using env device %s. (this is just always 0)' % str(env_device))
+    logging.info('Using env device %s.' % str(env_device))
 
-    gripper_mode = Discrete()
+    gripper_mode   = Discrete()
     arm_action_mode = EndEffectorPoseViaPlanning()
-    action_mode = MoveArmThenGripper(arm_action_mode, gripper_mode)
+    action_mode    = MoveArmThenGripper(arm_action_mode, gripper_mode)
 
     task_files = [t.replace('.py', '') for t in os.listdir(rlbench_task.TASKS_PATH)
                   if t != '__init__.py' and t.endswith('.py')]
-    eval_cfg.rlbench.cameras = eval_cfg.rlbench.cameras if isinstance(
-        eval_cfg.rlbench.cameras, ListConfig) else [eval_cfg.rlbench.cameras]
-    obs_config = utils.create_obs_config(eval_cfg.rlbench.cameras,
-                                        eval_cfg.rlbench.camera_resolution,
-                                        train_cfg.method.name,
-                                        use_depth=train_cfg.method.use_depth,
-                                        use_nerf_multi_view=False,  # no NeRF views at eval time
-                                        )
 
+    eval_cfg.rlbench.cameras = (
+        eval_cfg.rlbench.cameras
+        if isinstance(eval_cfg.rlbench.cameras, ListConfig)
+        else [eval_cfg.rlbench.cameras]
+    )
+    obs_config = utils.create_obs_config(
+        eval_cfg.rlbench.cameras,
+        eval_cfg.rlbench.camera_resolution,
+        train_cfg.method.name,
+        use_depth=use_depth,
+        use_nerf_multi_view=False,   # NeRF rendering is disabled at eval time
+    )
     if eval_cfg.cinematic_recorder.enabled:
         obs_config.record_gripper_closing = True
 
-    # Always use the training episode_length so the time-in-state encoding
-    # seen at eval matches exactly what the model was trained on.
-    episode_length = train_cfg.rlbench.episode_length
+    # ---------------------------------------------------------------------------
+    # Build env_config tuple consumed by IndependentEnvRunner → CustomMultiTaskRLBenchEnv
+    # or CustomRLBenchEnv.  The positional layout must exactly match what the
+    # runner unpacks (see third_party/YARR/yarr/runners/independent_env_runner.py):
+    #
+    #   Multi-task:  [task_classes, obs_config, action_mode, dataset_root,
+    #                 episode_length, headless, swap_task_every,
+    #                 include_lang_goal_in_obs, time_in_state, record_every_n]
+    #
+    #   Single-task: [task_class, obs_config, action_mode, dataset_root,
+    #                 episode_length, headless,
+    #                 include_lang_goal_in_obs, time_in_state, record_every_n]
+    # ---------------------------------------------------------------------------
+    multi_task = len(eval_cfg.rlbench.tasks) > 1
 
-    # single-task or multi-task
-    if len(eval_cfg.rlbench.tasks) > 1:
+    if multi_task:
         tasks = eval_cfg.rlbench.tasks
-        multi_task = True
-
         task_classes = []
         for task in tasks:
             if task not in task_files:
                 raise ValueError('Task %s not recognised!.' % task)
             task_classes.append(task_file_to_task_class(task))
 
-        env_config = (task_classes,
-                      obs_config,
-                      action_mode,
-                      eval_cfg.rlbench.demo_path,
-                      episode_length,
-                      eval_cfg.rlbench.headless,
-                      eval_cfg.framework.eval_episodes,
-                      train_cfg.rlbench.include_lang_goal_in_obs,
-                      train_cfg.rlbench.time_in_state,        # must match training
-                      eval_cfg.framework.record_every_n)
+        env_config = (
+            task_classes,
+            obs_config,
+            action_mode,
+            eval_cfg.rlbench.demo_path,      # test-data path (intentionally differs from training)
+            episode_length,                   # from train_cfg — must match training
+            eval_cfg.rlbench.headless,
+            eval_cfg.framework.eval_episodes, # swap_task_every: rotate tasks this often
+            include_lang_goal,                # from train_cfg — must match training
+            time_in_state,                    # from train_cfg — must match training
+            eval_cfg.framework.record_every_n,
+        )
     else:
         task = eval_cfg.rlbench.tasks[0]
-        multi_task = False
-
         if task not in task_files:
             raise ValueError('Task %s not recognised!.' % task)
         task_class = task_file_to_task_class(task)
 
-        env_config = (task_class,
-                      obs_config,
-                      action_mode,
-                      eval_cfg.rlbench.demo_path,
-                      episode_length,
-                      eval_cfg.rlbench.headless,
-                      train_cfg.rlbench.include_lang_goal_in_obs,
-                      train_cfg.rlbench.time_in_state,        # must match training
-                      eval_cfg.framework.record_every_n)
+        env_config = (
+            task_class,
+            obs_config,
+            action_mode,
+            eval_cfg.rlbench.demo_path,      # test-data path (intentionally differs from training)
+            episode_length,                   # from train_cfg — must match training
+            eval_cfg.rlbench.headless,
+            include_lang_goal,                # from train_cfg — must match training
+            time_in_state,                    # from train_cfg — must match training
+            eval_cfg.framework.record_every_n,
+        )
 
     logging.info('Evaluating seed %d.' % start_seed)
 

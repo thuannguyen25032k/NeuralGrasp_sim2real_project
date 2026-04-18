@@ -45,6 +45,9 @@ def main(cfg: DictConfig) -> None:
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
     print("device available: ", torch.cuda.device_count())
 
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cudnn.benchmark = True
+
     cfg.rlbench.cameras = cfg.rlbench.cameras \
         if isinstance(cfg.rlbench.cameras, ListConfig) else [cfg.rlbench.cameras]
     obs_config = create_obs_config(cfg.rlbench.cameras,
@@ -93,8 +96,9 @@ def main(cfg: DictConfig) -> None:
         world_size = cfg.ddp.num_devices
 
         if cfg.method.use_fabric:
-            # we use fabric DDP
-            fabric = L.Fabric(devices=world_size, strategy='ddp')
+            precision = getattr(cfg.framework, 'precision', '32-true')
+            fabric = L.Fabric(devices=world_size, strategy='ddp',
+                              precision=precision)
             fabric.launch()
             run_seed_fn.run_seed(
                                 0,  # rank, will be overwrited by fabric

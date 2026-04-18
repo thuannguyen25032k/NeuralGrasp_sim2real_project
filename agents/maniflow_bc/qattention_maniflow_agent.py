@@ -1160,7 +1160,7 @@ class ManiFlowBCAgent(Agent):
 
             if rank == 0:
                 os.makedirs('recon', exist_ok=True)
-                rgb_src = obs[0][0].squeeze(0).permute(1, 2, 0).cpu() / 2 + 0.5
+                rgb_src = obs[0][0][0].permute(1, 2, 0).cpu() / 2 + 0.5
 
                 fig, axs = plt.subplots(1, 7, figsize=(21, 3))
                 # 0: input view
@@ -1264,18 +1264,26 @@ class ManiFlowBCAgent(Agent):
         obs, depth, pcd, extrinsics, intrinsics = self._act_preprocess_inputs(observation)
 
         # Move to device
-        obs    = [[o[0][0].to(self._device), o[1][0].to(self._device)] for o in obs]
-        depth  = [d[0].to(self._device) for d in depth]
+        # From YARR, each observation tensor arrives as (1, timesteps, C, H, W).
+        # We take [:, 0] to strip the timestep dim (dim-1), giving (1, C, H, W) —
+        # the same (B, C, H, W) shape that encode_scene expects.
+        # NOTE: all four per-camera tensors (rgb, pcd, depth) must use [:, 0]
+        # to strip the *timestep* dimension.  Using [0] instead would strip the
+        # *batch* dimension, giving (T, C, H, W) — wrong when T > 1.
+        obs    = [[o[0][:, 0].to(self._device), o[1][:, 0].to(self._device)] for o in obs]
+        depth  = [d[:, 0].to(self._device) for d in depth]
         # observation['low_dim_state'] arrives from YARR as (1, timesteps, 4).
         # Strip the timestep dimension (dim-1) to match the training shape (B, 4),
         # mirroring PreprocessAgent._strip_time's `v[:, 0]` in the replay path.
         proprio = proprio[:, 0, :].to(self._device) if proprio is not None else None
-        pcd    = [p[0].to(self._device) for p in pcd]
+        # pcd arrives as (1, timesteps, 3, H, W) — use [:, 0] like obs/depth.
+        pcd    = [p[:, 0].to(self._device) for p in pcd]
         extrinsics = [e.to(self._device) for e in extrinsics]
         intrinsics = [i.to(self._device) for i in intrinsics]
         lang_goal_emb   = lang_goal_emb.to(self._device)
         lang_token_embs = lang_token_embs.to(self._device)
         bounds          = torch.as_tensor(bounds, device=self._device)
+
         # prev_layer_voxel_grid and prev_layer_bounds are lists of tensors
         # (appended by act() across layers), not bare tensors — use list comp.
         prev_layer_voxel_grid = (

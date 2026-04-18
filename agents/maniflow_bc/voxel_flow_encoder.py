@@ -223,11 +223,14 @@ class TransformerHead(nn.Module):
         self,
         timestep:      torch.Tensor,   # (B,)
         proprio_feats: torch.Tensor,   # (B, embedding_dim) or None
+        lang_pooled:   torch.Tensor = None,   # (B, embedding_dim) or None
     ) -> torch.Tensor:
-        """Compute AdaLN conditioning signal = time_emb + proprio_emb."""
+        """Compute AdaLN conditioning signal = time_emb + proprio_emb + lang_pool."""
         time_feats = self.time_emb(timestep)
         if proprio_feats is not None:
             time_feats = time_feats + self.curr_gripper_emb(proprio_feats)
+        if lang_pooled is not None:
+            time_feats = time_feats + lang_pooled
         return time_feats   # (B, embedding_dim)
 
     def forward(
@@ -241,6 +244,7 @@ class TransformerHead(nn.Module):
         traj_xyz_world:   torch.Tensor = None,     # (B, T, 3)  unnormalised world coords
         full_vox_tokens:  torch.Tensor = None,     # (B, N, embedding_dim)  full set — cross-attn
         full_vox_pos:     torch.Tensor = None,     # (B, N, 3)              full positions
+        lang_pooled:      torch.Tensor = None,     # (B, embedding_dim)  pooled lang for AdaLN
     ):
         """
         Returns a list of length 1 containing (B, T, 10):
@@ -263,7 +267,7 @@ class TransformerHead(nn.Module):
             full_vox_pos = voxel_pos
 
         # ---- AdaLN conditioning signal ------------------------------------ #
-        time_embs = self.encode_denoising_timestep(timestep, proprio_feats)  # (B, emb)
+        time_embs = self.encode_denoising_timestep(timestep, proprio_feats, lang_pooled)  # (B, emb)
 
         # ---- Encode trajectory tokens ------------------------------------ #
         # Mirrors base_denoise_actor: traj_feats = traj_encoder(trajectory)
@@ -557,6 +561,22 @@ class VoxelFlowEncoder(nn.Module):
             self.proprio_proj = None
 
         # ------------------------------------------------------------------ #
+        # 5b. Language pooling for AdaLN conditioning.                        #
+        #                                                                      #
+        # IMPROVEMENT: without this, AdaLN's modulation signal contains only   #
+        # time + proprio — every AdaLN-modulated layer operates without        #
+        # global task awareness, and language information only enters via the  #
+        # single-layer traj↔lang cross-attn.  Mean-pooling lang_tokens and     #
+        # projecting it into the AdaLN signal gives every modulated layer a   #
+        # task-level prior (standard technique in text-conditioned DiTs).      #
+        # ------------------------------------------------------------------ #
+        self.lang_pool_proj = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+
+        # ------------------------------------------------------------------ #
         # 6.  Transformer denoising head                                      #
         # ------------------------------------------------------------------ #
         self.transformer_head = TransformerHead(
@@ -797,36 +817,29 @@ class VoxelFlowEncoder(nn.Module):
             seq2_pos=None,
         )[-1]   # (B, vl_fps_size, emb)
 
-        # Write task-conditioned features back into the full token set so that
-        # the cross-attention in the Transformer head still has access to all N
-        # world positions with updated (language-conditioned) features.
-        if self.num_fps_tokens > 0 and vl_fps_size < N_full:
-            vox_tokens = vox_tokens.clone()
-            vox_tokens.scatter_(
-                1,
-                vl_idx_exp,
-                vl_tokens_sub,
-            )
+        # IMPROVEMENT: use the VL-conditioned subset as the cross-attn source.
+        # Previously we scatter-wrote the 1024 VL-conditioned tokens back into
+        # the 8000-token full set, but the remaining ~7000 tokens were never
+        # task-conditioned — so the Transformer head's cross_attn was mostly
+        # attending to language-agnostic scene features.  Using vl_tokens_sub
+        # as full_vox_tokens guarantees every token the head cross-attends to
+        # is language-aware, and reduces cross-attn cost from N_full → vl_fps_size.
+        cross_attn_tokens = vl_tokens_sub        # (B, vl_fps_size, emb), VL-conditioned
+        cross_attn_pos    = vl_pos_sub           # (B, vl_fps_size, 3)
 
         # Density-based feature-space subsampling: keep M semantically
         # diverse tokens for the joint self-attention trunk.
-        # Mirrors base_encoder.run_dps / density_based_sampler from 3D
-        # FlowMatch Actor.  We pass the FULL vox_tokens to cross_attn
-        # (fine-grained detail) and only the subsampled fps_tokens to
-        # the joint self-attn (efficiency).
+        # Selection operates on the VL-conditioned features (same tokens that
+        # will feed the cross-attention above), so both attn paths see a
+        # consistent, task-conditioned view of the scene.
         if self.num_fps_tokens > 0:
             dps_idx    = self._density_based_sample(vl_tokens_sub, self.num_fps_tokens)  # (B, M)
-            # Map local vl_fps indices back to the full token index space
-            if vl_fps_size < N_full:
-                global_dps_idx = torch.gather(vl_idx, 1, dps_idx)        # (B, M) in [0, N)
-            else:
-                global_dps_idx = dps_idx
-            idx_exp    = global_dps_idx.unsqueeze(-1).expand(-1, -1, vox_tokens.shape[-1]).contiguous()
-            fps_tokens = torch.gather(vox_tokens, 1, idx_exp)             # (B, M, emb)
-            fps_pos    = torch.gather(voxel_pos, 1,
-                                      global_dps_idx.unsqueeze(-1).expand(-1, -1, 3).contiguous())  # (B,M,3)
+            idx_exp    = dps_idx.unsqueeze(-1).expand(-1, -1, vl_tokens_sub.shape[-1]).contiguous()
+            fps_tokens = torch.gather(vl_tokens_sub, 1, idx_exp)             # (B, M, emb)
+            fps_pos    = torch.gather(vl_pos_sub, 1,
+                                      dps_idx.unsqueeze(-1).expand(-1, -1, 3).contiguous())  # (B,M,3)
         else:
-            fps_tokens, fps_pos = vox_tokens, voxel_pos
+            fps_tokens, fps_pos = vl_tokens_sub, vl_pos_sub
 
         # Proprio embedding: project gripper_open only -> embedding_dim
         # FIX D: slice dim 0 (gripper_open) so that spatial joint-velocity
@@ -836,12 +849,17 @@ class VoxelFlowEncoder(nn.Module):
             gripper_open  = proprio[:, :1].float()               # (B, 1)
             proprio_feats = self.proprio_proj(gripper_open)       # (B, emb)
 
+        # Mean-pool language tokens and project for AdaLN conditioning.
+        # Gives every AdaLN-modulated layer a global task signal.
+        lang_pooled = self.lang_pool_proj(lang_tokens.mean(dim=1))  # (B, emb)
+
         context = {
-            'voxel_tokens':      fps_tokens,    # (B, M, emb) — FPS subset, for self-attn
-            'voxel_pos':         fps_pos,        # (B, M, 3)
-            'full_vox_tokens':   vox_tokens,     # (B, N, emb) — full set, for cross-attn
-            'full_vox_pos':      voxel_pos,      # (B, N, 3)
+            'voxel_tokens':      fps_tokens,           # (B, M, emb) — FPS subset, for self-attn
+            'voxel_pos':         fps_pos,              # (B, M, 3)
+            'full_vox_tokens':   cross_attn_tokens,    # (B, vl_fps_size, emb) — VL-conditioned, for cross-attn
+            'full_vox_pos':      cross_attn_pos,       # (B, vl_fps_size, 3)
             'lang_tokens':       lang_tokens,
+            'lang_pooled':       lang_pooled,          # (B, emb) — for AdaLN
             'proprio_feats':     proprio_feats,
         }
         return d0, l, context
@@ -873,6 +891,7 @@ class VoxelFlowEncoder(nn.Module):
             full_vox_pos      = context.get('full_vox_pos',    voxel_pos)
             lang_tokens       = context['lang_tokens']
             proprio_feats     = context.get('proprio_feats', None)
+            lang_pooled       = context.get('lang_pooled', None)
         else:
             B = noisy_trajectory.shape[0]
             device = noisy_trajectory.device
@@ -882,6 +901,7 @@ class VoxelFlowEncoder(nn.Module):
             full_vox_pos    = voxel_pos
             lang_tokens     = torch.zeros(B, 1, self.embedding_dim, device=device)
             proprio_feats   = None
+            lang_pooled     = None
 
         # Unnormalize trajectory xyz ([-1,1] → world coords) for 3D RoPE.
         # This mirrors base_denoise_actor.policy_forward_pass which computes
@@ -901,6 +921,7 @@ class VoxelFlowEncoder(nn.Module):
             full_vox_pos=full_vox_pos.float(),
             lang_tokens=lang_tokens.float(),
             proprio_feats=proprio_feats.float() if proprio_feats is not None else None,
+            lang_pooled=lang_pooled.float() if lang_pooled is not None else None,
             traj_xyz_world=traj_xyz_world.float(),
         )
 

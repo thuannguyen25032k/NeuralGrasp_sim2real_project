@@ -128,6 +128,6 @@ class PositionEmbeddingLearnedMLP(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, xyz):
-        """Forward pass, xyz is (B, N, 3or6), output (B, F, N)."""
+        """Forward pass, xyz is (B, N, 3or6), output (B, N, num_pos_feats)."""
         position_embedding = self.position_embedding_head(xyz)
         return position_embedding

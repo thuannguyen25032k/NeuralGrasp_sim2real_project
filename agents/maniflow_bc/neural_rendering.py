@@ -80,7 +80,7 @@ class NeuralRenderer(nn.Module):
                 model_name='dinov2_vitl14',
             )
             self.dino_preprocess = T.Compose([
-                T.Resize(224 * 8, antialias=True),  # must be a multiple of 14
+                T.Resize(224 * 2, antialias=True),  # 448, multiple of 14
             ])
             cprint("dinov2 feature dims: "+str(self.feature_extractor.feature_dims), "yellow")
         else:
@@ -118,6 +118,7 @@ class NeuralRenderer(nn.Module):
         gt_embed     = gt_embed     / (gt_embed.norm(dim=-1, keepdim=True) + MIN_DENOMINATOR)
 
         if self.loss_embed_fn == "l2_norm":
+            # L2 loss on already-normalised vectors (both sides are unit-normalised above)
             loss_embed = l2_loss(render_embed, gt_embed)
         elif self.loss_embed_fn == "l2":
             loss_embed = l2_loss(render_embed, gt_embed)
@@ -139,19 +140,19 @@ class NeuralRenderer(nn.Module):
 
     def _batched_pca(self, feat, in_channels):
         """
-        Vectorised batched PCA via a single torch.linalg.svd call.
-        feat  : [bs, in_channels, H, W]
-        return: [bs, d_embed, H, W]
+        PCA projection: (bs, C, H, W) → (bs, d_embed, H, W).
+
+        Uses torch.linalg.svd for a single fully-vectorised batched call,
+        which is faster and more numerically stable than the previous
+        torch.pca_lowrank loop (adopted from manigaussian_bc).
         """
         bs, C, H, W = feat.shape
-        q = np.maximum(6, self.d_embed)
-        A = feat.reshape(bs, C, -1).permute(0, 2, 1)  # [bs, H*W, C]
-        # mean-centre per sample for numerical stability
-        A = A - A.mean(dim=1, keepdim=True)
-        # single batched SVD — much faster than a Python for-loop
-        _, _, Vh = torch.linalg.svd(A, full_matrices=False)  # Vh: [bs, min(H*W,C), C]
-        V = Vh[:, :q, :].permute(0, 2, 1)                    # [bs, C, q]
-        proj = torch.bmm(A, V)[:, :, :self.d_embed]          # [bs, H*W, d_embed]
+        q = max(6, self.d_embed)
+        A = feat.reshape(bs, C, -1).permute(0, 2, 1).float()  # [bs, H*W, C]
+        A = A - A.mean(dim=1, keepdim=True)                    # centre columns
+        _, _, Vh = torch.linalg.svd(A, full_matrices=False)    # Vh: [bs, min(H*W,C), C]
+        V = Vh[:, :q, :].permute(0, 2, 1)                      # [bs, C, q]
+        proj = torch.bmm(A, V)[:, :, :self.d_embed]            # [bs, H*W, d_embed]
         return proj.permute(0, 2, 1).reshape(bs, self.d_embed, H, W)
 
     def extract_foundation_model_feature(self, gt_rgb, lang_goal):
@@ -295,9 +296,14 @@ class NeuralRenderer(nn.Module):
         render_embed = None
         gt_embed = None
 
-        # create gt feature from foundation models
         with torch.no_grad():
-            gt_embed = self.extract_foundation_model_feature(gt_rgb, lang_goal)
+            if gt_rgb is not None and gt_rgb.is_cuda:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    gt_embed = self.extract_foundation_model_feature(gt_rgb, lang_goal)
+                if gt_embed is not None:
+                    gt_embed = gt_embed.float()  # upcast back for downstream stability
+            else:
+                gt_embed = self.extract_foundation_model_feature(gt_rgb, lang_goal)
 
         # if gt_rgb is not None:
         if training:
@@ -329,7 +335,7 @@ class NeuralRenderer(nn.Module):
 
             loss = 0.
             # loss_rgb = self.cfg.lambda_l1 * Ll1 + self.cfg.lambda_ssim * Lssim
-            loss_rgb = Ll1
+            loss_rgb = self.cfg.lambda_rgb * Ll1
             loss += loss_rgb
 
             if gt_embed is not None:
@@ -342,13 +348,12 @@ class NeuralRenderer(nn.Module):
                 loss_embed = self._embed_loss_fn(render_embed, gt_embed)
                 loss += self.cfg.lambda_embed * loss_embed
             else:
-                loss_embed = torch.tensor(0.)
+                loss_embed = torch.tensor(0., device=render_novel.device)
 
             # next frame prediction
             if self.use_dynamic_field and (next_gt_rgb is not None) and ('xyz_maps' in data['next']):
                 data['next'] = self.pts2render(data['next'], bg_color=self.bg_color)
                 next_render_novel = data['next']['novel_view']['img_pred'].permute(0, 2, 3, 1)
-                # loss_dyna = l1_loss(next_render_novel, next_gt_rgb)
                 loss_dyna = l2_loss(next_render_novel, next_gt_rgb)
                 lambda_dyna = self.cfg.lambda_dyna if step >= self.cfg.next_mlp.warm_up else 0.
                 loss += lambda_dyna * loss_dyna

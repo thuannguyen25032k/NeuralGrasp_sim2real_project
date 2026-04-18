@@ -56,7 +56,8 @@ class DummyLayer(nn.Module):
 
 
 class FFWLayer(DummyLayer):
-    """Feed-forward layer (ReLU MLP + optional AdaLN)."""
+    """Feed-forward layer (GELU MLP + optional AdaLN).
+    """
 
     def __init__(self, d_model, dim_fw=None, dropout=0.1, use_adaln=False,
                  pre_norm=False):
@@ -64,7 +65,7 @@ class FFWLayer(DummyLayer):
         dim_fw = 4 * d_model if dim_fw is None else dim_fw
         self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_fw),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(dim_fw, d_model),
             nn.Dropout(dropout)

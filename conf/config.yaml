@@ -11,6 +11,8 @@ rlbench:
     # you could try more/fewer demos.
     demos: 20
     # you could try more/fewer views.
+    # NOTE: must be >= method.num_view_for_nerf (set in ManiFlow_BC.yaml).
+    # replay buffer allocates this many slots; agent subsamples to method.num_view_for_nerf.
     num_view_for_nerf: 21
     demo_path: /my/demo/path    # will be removed by "${cur_dir}/data/train_data" in cli
     episode_length: 15
@@ -48,7 +50,7 @@ framework:
     save_freq: 10000
     train_envs: 1
     replay_ratio: ${replay.batch_size}
-    transitions_before_train: 200
+    transitions_before_train: 1000   # increased from 200 — 200/8=25 gradient steps is too few warm-up
     tensorboard_logging: False
     csv_logging: True
     training_iterations: 100010
@@ -58,10 +60,11 @@ framework:
     logging_level: 20 # https://docs.python.org/3/library/logging.html#levels
     seeds: 1
     start_seed: 0
-    load_existing_weights: False
+    load_existing_weights: True
     num_weights_to_keep: 60 # older checkpoints will be deleted chronologically
     num_workers: 8
     record_every_n: 5
+    precision: '32'
     # wandb setting
     use_wandb: True
     wandb_project: "manigaussian"

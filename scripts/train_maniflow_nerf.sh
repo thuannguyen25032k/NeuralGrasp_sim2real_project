@@ -39,17 +39,28 @@ log_file="${log_dir}/${exp_name}_$(date +%Y%m%d_%H%M%S).log"
 echo "Log file: ${log_file}"
 
 # ---- Hyperparameters -------------------------------------------------------
-batch_size=8
-tasks=[put_money_in_safe]
+# SR-FIX NeRF#3: batch_size raised 4 → 6 so that (a) the grip BCE sees more
+# positive/negative samples per step (was only 4), and (b) the NeRF renderer
+# gets more view diversity per update.  6 fits comfortably in 48 GB with
+# DINOv2 + dynamic field enabled (~30 GB estimated peak).
+batch_size=4
+tasks=[light_bulb_in,put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,place_shape_in_shape_sorter,push_buttons,insert_onto_square_peg,stack_cups]
 demo=100
 
 lr=0.0001
 optimizer=adam
-lr_scheduler=False
+# FIX X13 (run4): enable cosine LR schedule with 3k-step warmup.  Constant
+# LR (run3) bottoms out around pos_loss=0.3 on 200k steps; cosine decay
+# from 1e-4 with warmup reliably drops the final pos_loss another 20-30 %
+# by making the last ~60 % of training increasingly precision-focused.
+lr_scheduler=True
+num_warmup_steps=3000
 
-# lv2_batch_size: inner noise re-sampling loop — 3 gives 3× gradient diversity
-# with negligible cost (scene encoding is reused).
-lv2_batch_size=3
+# SR-FIX NeRF#12: pin precision explicitly to '32' (old Lightning Fabric API).
+# bf16 can destabilise the Gaussian Splatting renderer (log-sigmoid opacities
+# and exp-scale transforms are prone to bf16 overflow).  The NeRF path is
+# kept in fp32 even though the no-nerf path uses bf16.
+precision='32'
 
 training_iterations=200010
 save_freq=10000
@@ -73,18 +84,20 @@ train_cmd=(
     "ddp.master_port=${port}"
     "rlbench.tasks=${tasks}"
     "rlbench.demos=${demo}"
-    # ---- Enable neural rendering -------------------------------------------
-    "method.use_neural_rendering=True"
+    # ---- Enable neural rendering -------------------------------------------1
+    "method.use_neural_rendering=False"
+    "method.neural_renderer.foundation_model_name=diffusion"
+	"method.neural_renderer.use_dynamic_field=True"
     # ---- Optimizer ---------------------------------------------------------
     "method.lr=${lr}"
     "method.optimizer=${optimizer}"
     "method.lr_scheduler=${lr_scheduler}"
-    "method.num_warmup_steps=0"
-    # ---- Flow-matching hyperparameters -------------------------------------
-    "method.lv2_batch_size=${lv2_batch_size}"
+    "method.num_warmup_steps=${num_warmup_steps}"
     # ---- Training schedule -------------------------------------------------
     "framework.training_iterations=${training_iterations}"
     "framework.save_freq=${save_freq}"
+    # ---- Precision (SR-FIX NeRF#12) ----------------------------------------
+    "framework.precision=${precision}"
 )
 
 echo "Running ManiFlow (NeRF) training in foreground." | tee -a "${log_file}"

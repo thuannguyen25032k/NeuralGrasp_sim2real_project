@@ -38,9 +38,16 @@ log_file="${log_dir}/${exp_name}_$(date +%Y%m%d_%H%M%S).log"
 echo "Log file: ${log_file}"
 
 # ---- Hyperparameters -------------------------------------------------------
-batch_size=4
+# batch_size=8: the previous batch_size=4 gave only 16 BCE samples per step
+# for the gripper head (B=4 × T=1 × nhand=1 × lv2=4).  Across 9 diverse
+# multi-task training tasks that is < 2 grip samples per task per step,
+# causing the logged L_grip to oscillate wildly (0.07 → 1.44 swings).
+# batch_size=8 doubles per-step grip coverage and halves SGD variance on
+# pos/rot velocity predictions — the main driver of late-training SR.
+# VRAM usage: ~12 GB on RTX 6000 Ada (48 GB available) for the no-NeRF path.
+batch_size=8
 # Single easy task for a quick correctness check — change as needed.
-tasks=[put_money_in_safe]
+tasks=[light_bulb_in,put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,place_shape_in_shape_sorter,push_buttons,insert_onto_square_peg,stack_cups,place_cups]
 demo=100
 
 # Optimizer — reference 3D FlowMatch Actor: Adam lr=1e-4, constant schedule.
@@ -48,15 +55,17 @@ demo=100
 # Transformer and causes the loss to plateau after ~2k steps.
 lr=0.0001
 optimizer=adam
+# CRITICAL: keep lr_scheduler=False and num_warmup_steps=0.
+# Using lr_scheduler=True with num_warmup_steps=0 causes cosine decay from
+# step 0 — by step 100k (33%) the LR is already halved, effectively
+# under-training the entire run.  Constant LR matches the reference exactly.
 lr_scheduler=False
+num_warmup_steps=0
 
-# lv2_batch_size: inner noise re-sampling loop — 3 gives 3× gradient diversity
-# with negligible cost (scene encoding is reused).
-lv2_batch_size=3
-
-# Run for 200K steps (a reasonable check run; reference uses 300K for multi-task)
-training_iterations=200010
+# Run for 300K steps (a reasonable check run; reference uses 300K for multi-task)
+training_iterations=400010
 save_freq=10000
+precision='bf16'
 # ----------------------------------------------------------------------------
 
 echo "Starting ManiFlow (no-NeRF) training: method=${method}, seed=${seed}, num_devices=${#train_gpu_list[@]}, port=${port}, exp=${exp_name}" | tee -a "${log_file}"
@@ -83,12 +92,11 @@ train_cmd=(
     "method.lr=${lr}"
     "method.optimizer=${optimizer}"
     "method.lr_scheduler=${lr_scheduler}"
-    "method.num_warmup_steps=0"
-    # ---- Flow-matching hyperparameters -------------------------------------
-    "method.lv2_batch_size=${lv2_batch_size}"
+    "method.num_warmup_steps=${num_warmup_steps}"
     # ---- Training schedule -------------------------------------------------
     "framework.training_iterations=${training_iterations}"
     "framework.save_freq=${save_freq}"
+    "framework.precision=${precision}"
 )
 
 echo "Running ManiFlow (no-NeRF) training in foreground." | tee -a "${log_file}"
