@@ -1373,48 +1373,77 @@ class ManiFlowBCAgent(Agent):
         if isinstance(device, int):
             device = torch.device('cuda:%d' % device)
         weight_file = os.path.join(savedir, '%s.pt' % self._name)
-        state_dict  = torch.load(weight_file, map_location=device)
-        merged      = self._q.state_dict()
+        state_dict = torch.load(weight_file, map_location=device, weights_only=True)
+
+        # Fabric's _FabricModule overrides state_dict() to produce clean keys, but
+        # does NOT override load_state_dict() — PyTorch's base implementation would
+        # expect wrapped keys (e.g. "_forward_module.module.*") and report everything
+        # as missing.  Fix: unwrap to the actual nn.Module before loading.
+        def _unwrap(m):
+            m = getattr(m, '_forward_module', m)  # _FabricModule → DDP or actual
+            m = getattr(m, 'module', m)           # DDP           → actual
+            return m
+
+        # Route each key to the appropriate submodule dict (stripping the prefix).
+        flow_sd, nerf_sd, other_sd = {}, {}, {}
         for k, v in state_dict.items():
-            if not self._training:
-                k = k.replace('_flow_encoder.module', '_flow_encoder')
-                k = k.replace('_neural_renderer.module', '_neural_renderer')
-            # Always skip voxelizer buffers: they are batch-size-dependent
-            # (e.g. _ones_max_coords, _flat_output, _tiled_batch_indices,
-            # _index_grid) and will mismatch when loading a training
-            # checkpoint (batch_size=8) into an eval model (batch_size=1).
             if '_voxelizer' in k:
-                continue
-            if k in merged:
-                merged[k] = v
+                continue  # batch-size-dependent; skip
+            if k.startswith('_flow_encoder.'):
+                flow_sd[k[len('_flow_encoder.'):]] = v
+            elif k.startswith('_neural_renderer.'):
+                nerf_sd[k[len('_neural_renderer.'):]] = v
             else:
-                logging.warning(f"key {k} in checkpoint but not in model.")
-        msg = self._q.load_state_dict(merged, strict=False)
-        if msg.missing_keys:
-            cprint(f"missing keys: {msg.missing_keys}", 'yellow')
+                other_sd[k] = v
+
+        # _flow_encoder
+        msg = _unwrap(self._q._flow_encoder).load_state_dict(flow_sd, strict=False)
+        if msg.missing_keys or msg.unexpected_keys:
+            cprint(f"[load_weights] _flow_encoder: missing={msg.missing_keys} unexpected={msg.unexpected_keys}", 'yellow')
+
+        # _neural_renderer  (feature_extractor.* is frozen and loaded by fvcore at
+        # build() time — it is intentionally absent from the checkpoint, not an error)
+        if nerf_sd and self._q._neural_renderer is not None:
+            msg = _unwrap(self._q._neural_renderer).load_state_dict(nerf_sd, strict=False)
+            truly_missing = [k for k in msg.missing_keys if not k.startswith('feature_extractor.')]
+            if truly_missing or msg.unexpected_keys:
+                cprint(f"[load_weights] _neural_renderer: missing={truly_missing} unexpected={msg.unexpected_keys}", 'yellow')
+
+        # Remaining top-level keys (e.g. _coord_trans)
+        if other_sd:
+            q_sd = self._q.state_dict()
+            for k, v in other_sd.items():
+                if k in q_sd:
+                    q_sd[k] = v
+                else:
+                    logging.warning(f"[load_weights] unknown key '{k}' — skipped")
+            self._q.load_state_dict(q_sd, strict=False)
+
         cprint(f"Loaded weights from {weight_file}", 'cyan')
 
-        # FIX #15: load EMA shadow weights if available (written by save_weights).
         ema_file = os.path.join(savedir, '%s_ema.pt' % self._name)
         if os.path.isfile(ema_file):
-            self._ema_weights = torch.load(ema_file, map_location='cpu')
+            self._ema_weights = torch.load(ema_file, map_location='cpu', weights_only=True)
             cprint(f"Loaded EMA weights from {ema_file}", 'cyan')
+        elif self._ema_decay is not None:
+            # EMA was enabled during training but no _ema.pt found — warn loudly
+            # so the user knows inference will use raw weights instead of EMA.
+            cprint(
+                f"[load_weights] WARNING: EMA is enabled (decay={self._ema_decay}) but "
+                f"no EMA checkpoint found at {ema_file}. "
+                "Inference will use raw model weights — performance may be degraded.",
+                'red'
+            )
 
     def save_weights(self, savedir: str):
-        # Exclude batch-size-dependent voxelizer buffers so checkpoints are
-        # portable across different batch sizes (train vs eval).
+        # Exclude voxelizer buffers (batch-size-dependent) and the frozen
+        # feature_extractor backbone (loaded from pretrained SD/DiNO at build time).
         state_dict = {k: v for k, v in self._q.state_dict().items()
-                      if '_voxelizer' not in k}
-        torch.save(
-            state_dict,
-            os.path.join(savedir, '%s.pt' % self._name)
-        )
-        # FIX #15: persist EMA shadow weights alongside the live checkpoint.
+                      if '_voxelizer' not in k
+                      and not k.startswith('_neural_renderer.feature_extractor.')}
+        torch.save(state_dict, os.path.join(savedir, '%s.pt' % self._name))
         if self._ema_weights:
-            torch.save(
-                self._ema_weights,
-                os.path.join(savedir, '%s_ema.pt' % self._name)
-            )
+            torch.save(self._ema_weights, os.path.join(savedir, '%s_ema.pt' % self._name))
 
     def load_clip(self): pass
     def unload_clip(self): pass

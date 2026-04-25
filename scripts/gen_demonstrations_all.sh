@@ -9,8 +9,8 @@
 
 set -euo pipefail
 
-# ALL_TASK="close_jar open_drawer sweep_to_dustpan_of_size meat_off_grill turn_tap slide_block_to_color_target put_item_in_drawer reach_and_drag stack_blocks"
-ALL_TASK="light_bulb_in put_money_in_safe place_wine_at_rack_location put_groceries_in_cupboard place_shape_in_shape_sorter push_buttons insert_onto_square_peg stack_cups place_cups"
+ALL_TASK="close_jar open_drawer sweep_to_dustpan_of_size meat_off_grill turn_tap slide_block_to_color_target put_item_in_drawer reach_and_drag push_buttons stack_blocks"
+# ALL_TASK="light_bulb_in put_money_in_safe place_wine_at_rack_location put_groceries_in_cupboard place_shape_in_shape_sorter push_buttons insert_onto_square_peg stack_cups place_cups"
 
 MAX_PARALLEL_TASKS=2
 

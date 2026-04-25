@@ -15,7 +15,7 @@ rlbench:
     # replay buffer allocates this many slots; agent subsamples to method.num_view_for_nerf.
     num_view_for_nerf: 21
     demo_path: /my/demo/path    # will be removed by "${cur_dir}/data/train_data" in cli
-    episode_length: 15
+    episode_length: 20
     # full cameras: [front,left_shoulder,right_shoulder,wrist]
     # we find that one camera is very enough to achieve decent performance.
     cameras: [front]
@@ -36,7 +36,7 @@ replay:
 
 evaluation: # for online evaluation
     eval_freq: 10000
-    eval_episodes: 25
+    eval_episodes: 20
     time_in_state: True
     record_every_n: 10000
     episode_length: 15  # default

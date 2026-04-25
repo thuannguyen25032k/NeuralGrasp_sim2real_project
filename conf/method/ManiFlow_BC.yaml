@@ -7,8 +7,7 @@ use_depth: True
 use_neural_rendering: True
 num_view_for_nerf: 20
 
-# Language encoder
-# choices: T5 (768), CLIP (512)
+# Language encoder (CLIP: 512-dim)
 language_model: 'CLIP'
 language_model_dim: 512
 
@@ -18,115 +17,33 @@ bounds_offset: [0.15]
 voxel_sizes: [100]
 include_prev_layer: False
 
-# 3D-CNN encoder (same architecture as ManiGaussian_BC)
+# 3D-CNN encoder
 voxel_patch_size: 5
 voxel_patch_stride: 5
-final_dim: 128
-lang_fusion_type: 'seq'   # 'seq' or 'concat'
-# --- Transformer head hyperparameters -----------------------------------
-# embedding_dim: feature dimension for all Transformer layers.
-#   Must be divisible by num_attn_heads.
-#   128 / 8 = 16 (head dim too narrow); 192 / 8 = 24 (good balance of
-#   capacity and memory); 256 / 8 = 32 (higher capacity, more memory).
-#   Also avoids the 128→128 no-op projection since final_dim stays at 128.
-embedding_dim: 192
-# -----------------------------------------------------------------------
-# Flow-matching head  (Transformer — mirrors 3D FlowMatch Actor)
-# -----------------------------------------------------------------------
-# Architecture overview:
-#   VoxelFlowEncoder:
-#     ├── 3D-CNN voxel encoder  (im_channels output, shared with GS renderer)
-#     ├── Language pre-processor (lang_fusion_type: 'seq' or 'concat')
-#     ├── Voxel → token projection  (AdaptiveAvgPool3d + Linear → embedding_dim)
-#     │     token count = (voxel_sizes / voxel_token_downsample)^3
-#     │     then FPS-subsampled to num_fps_tokens
-#     ├── 3D RoPE positional encoding on voxel token world coords
-#     └── TransformerHead (denoising head):
-#           action query
-#             → cross-attn to lang tokens   (1 layer, no RoPE)
-#             → cross-attn to voxel tokens  (2 layers, 3D RoPE, AdaLN)
-#             → joint self-attn trunk       (num_shared_attn_layers, AdaLN)
-#             → pos head  (2-layer self-attn → Linear → 3)
-#             → rot head  (2-layer self-attn → Linear → 6, ortho6D)
-#             → grip head (Linear → 1)
-#   AdaLN conditioning signal = time_emb(t) + proprio_proj(gripper_state)
-# -----------------------------------------------------------------------
-action_dim: 8             # [x, y, z, qx, qy, qz, qw, gripper]
+final_dim: 192              # was 128 — larger 3D-CNN backbone features
+lang_fusion_type: 'seq'
 
-# num_attn_heads: number of attention heads in every AttentionModule.
-#   embedding_dim / num_attn_heads = head dimension.
-#   192 / 8 = 24 (good); 256 / 8 = 32.
+# -----------------------------------------------------------------------
+# Flow-matching head (Transformer — mirrors 3D FlowMatch Actor)
+# -----------------------------------------------------------------------
+embedding_dim: 256          # was 192 — wider Transformer (must be divisible by num_attn_heads)
+action_dim: 8               # [x, y, z, qx, qy, qz, qw, gripper]
 num_attn_heads: 8
-
-# num_shared_attn_layers: depth of the joint action+voxel self-attention
-#   trunk (AdaLN, 3D RoPE). Mirrors TransformerHead.self_attn depth.
-num_shared_attn_layers: 4
-
-# voxel_token_downsample: spatial stride applied via AdaptiveAvgPool3d
-#   before flattening the 3D-CNN voxel volume into a token sequence.
-#   Token count N = (voxel_size / voxel_token_downsample)^3
-#   e.g. voxel_size=100, stride=5  →  N = 20^3 = 8000 tokens (before FPS).
+num_shared_attn_layers: 6   # was 4 — deeper denoising trunk
 voxel_token_downsample: 5
-
-# num_fps_tokens: how many voxel tokens to keep after Farthest Point
-#   Sampling (FPS) — reduces computation from N to M in the self-attn trunk.
-#   Set to 0 to disable FPS and keep all N tokens.
 num_fps_tokens: 512
-
-# denoise_timesteps: number of rectified-flow denoising steps at inference.
-#   Does not affect training (training uses a single random t ~ U[0,1]).
-#   Rectified flow follows straight-line trajectories, so 20 steps is
-#   sufficient — 100 steps wastes ~5x inference time with no quality gain.
-denoise_timesteps: 20
-
-# action_chunk_size: number of action steps to predict per denoising call.
-#   T=1  → single next-step prediction (backward-compatible default).
-#   T>1  → predict a chunk / trajectory of T future steps; only the first
-#           step is executed at inference time.
+denoise_timesteps: 20       # inference only; training uses random t ~ U[0,1]
 action_chunk_size: 1
-
-# lv2_batch_size: number of inner noise re-sampling iterations in the loss.
-#   Each iteration re-samples a new noise tensor and a new timestep, but
-#   reuses the same encoded scene context — effectively multiplying the
-#   gradient diversity by N without re-running the 3D-CNN encoder.
-#   1 = no inner loop (standard RF loss); 2-4 = recommended for better grad.
-lv2_batch_size: 3
-
-# workspace_bounds: [x_min, y_min, z_min, x_max, y_max, z_max]
-#   Used to normalise xyz to [-1, 1] before the rectified-flow process.
-#   Must match the rlbench.scene_bounds used during data collection.
-#   Defaults to scene_bounds if not set here.
+lv2_batch_size: 3           # inner noise re-sampling iterations per step
 workspace_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
 
-# --- Legacy MLP stubs (NOT used — kept only for YAML backward-compat) ---
-# These keys were present in an earlier MLP-based prototype.
-# VoxelFlowEncoder accepts them as kwargs but ignores them entirely.
-flow_context_dim: 256   # ignored
-flow_hidden_dim: 512    # ignored
-flow_num_layers: 4      # ignored
-
 # Flow-matching loss weights
-# pos_loss_weight=30, grip_loss_weight=1 match the original 3D FlowMatch Actor.
-# rot_loss_weight raised to 20.0 (from 10.0 in the reference):
-#   F.l1_loss already computes the *mean* over all elements, so the number
-#   of ortho6D dims (6) vs pos dims (3) does NOT inflate the raw loss value.
-#   The 30 vs 20 ratio simply gives position 1.5× more emphasis per element,
-#   which is intentional: a wrong position causes a task failure (missed grasp)
-#   while a slightly wrong orientation often still succeeds.
-#   Raising rot from 10→20 is a deliberate rebalancing to give rotation more
-#   gradient signal than the reference; the 30:20 ratio is empirically reasonable.
 pos_loss_weight: 30.0
 rot_loss_weight: 20.0
 grip_loss_weight: 1.0
-
-# FIX #2: gripper threshold used at inference time.
-# BCE training is symmetric around 0.5; using 0.6 caused premature
-# open-gripper failures.  0.5 matches the training prior exactly.
-# Tune upward (e.g. 0.55) if you observe gripper jitter near grasp.
 grip_threshold: 0.5
 
-# FIX #15: EMA decay for model weight averaging at inference.
-# 0.999 matches the 3D FlowMatch Actor reference.  Set to 0.0 to disable.
+# EMA (0.0 to disable)
 ema_decay: 0.999
 
 # -----------------------------------------------------------------------
@@ -134,18 +51,11 @@ ema_decay: 0.999
 # -----------------------------------------------------------------------
 activation: lrelu
 norm: None
-
-# Reference 3D FlowMatch Actor uses lr=1e-4 with a constant LR schedule
-# and Adam optimizer — NOT LAMB and NOT cosine.
-# LAMB + lr=0.005 (the PerAct default) is 50x too high for a flow-matching
-# Transformer and causes the loss to plateau after ~2k steps.
 lr: 0.0001
-lr_scheduler: False         # constant LR — matches reference exactly
+lr_scheduler: False
 num_warmup_steps: 0
-optimizer: 'adam'           # 'adam' matches reference; 'lamb' overshoots
+optimizer: 'adam'
 lambda_weight_l2: 0.000001
-
-# BC loss coefficient
 lambda_bc: 1.0
 
 # Augmentation
@@ -154,13 +64,13 @@ transform_augmentation:
   apply_se3: True
   aug_xyz: [0.05, 0.05, 0.05]
   aug_rpy: [0.0, 0.0, 45.0]
-  aug_rot_resolution: 5     # kept for SE3 augmentation utility
+  aug_rot_resolution: 5
 
 demo_augmentation: True
 demo_augmentation_every_n: 10
 
 # Misc
-rotation_resolution: 5      # kept for replay/augmentation helpers
+rotation_resolution: 5
 no_skip_connection: False
 keypoint_method: 'heuristic'
 
@@ -168,36 +78,18 @@ keypoint_method: 'heuristic'
 use_wandb: True
 
 # -----------------------------------------------------------------------
-# Gaussian Splatting auxiliary renderer (unchanged from ManiGaussian_BC)
+# Gaussian Splatting auxiliary renderer
 # -----------------------------------------------------------------------
 neural_renderer:
   visdom: False
   render_freq: 1000
-
   use_clip: False
   use_dynamic_field: False
 
-  # -----------------------------------------------------------------------
-  # NeRF auxiliary loss weights
-  # -----------------------------------------------------------------------
-  # lambda_nerf: outer weight on the entire nerf_loss before adding to
-  #   total_loss.  Keep small so the GS renderer doesn't distort the BC
-  #   policy gradient.  0.02 gives the renderer ~0.1% of total gradient,
-  #   enough to train the GS model without interfering with flow_loss.
-  #
-  # lambda_rgb: weight on per-pixel L2 reconstruction inside nerf_loss.
-  #   Already the dominant NeRF signal, keep at 1.0.
-  #
-  # lambda_embed: weight on cosine embed loss INSIDE nerf_loss.
-  #   Effective total weight = lambda_nerf × lambda_embed.
-  #   Old: 0.01 × 0.01 = 0.0001  (negligible — embed never trained).
-  #   New: 0.04 × 0.5  = 0.02    (meaningful signal with diffusion foundation model).
-  # -----------------------------------------------------------------------
-  lambda_nerf: 0.04
-  lambda_embed: 0.5
+  # Loss weights (total GS loss = lambda_nerf * (lambda_rgb * L_rgb + lambda_embed * L_embed))
+  lambda_nerf: 0.1
   lambda_rgb: 1.0
-  lambda_l1: 1.0
-  lambda_ssim: 0.0
+  lambda_embed: 0.5
   lambda_dyna: 0.01
   lambda_reg: 0.0
 
@@ -211,19 +103,17 @@ neural_renderer:
     mask_gt_rgb: False
 
   foundation_model_name: 'diffusion'  # null | 'diffusion' | 'dinov2'
-  d_embed: 3  # Must stay 3: the CUDA GS rasterizer hardcodes language_feature_precomp to [N,3]
+  d_embed: 3   # CUDA GS rasterizer hardcodes language_feature_precomp to [N,3]
   loss_embed_fn: cosine
 
   d_latent: 128
   d_lang: 128
-
   voxel_shape: 100
   image_width: 128
   image_height: 128
   coordinate_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
 
   use_code: True
-  use_code_viewdirs: False
   use_xyz: True
 
   mlp:
@@ -234,17 +124,15 @@ neural_renderer:
     beta: 0.0
     use_spade: False
     opacity_scale: 1.0
-    opacity_bias: -2.0
-    scale_bias: 0.02
+    opacity_bias: 0.0
+    scale_bias: 0.03
     scale_scale: 0.003
     xyz_scale: 0.1
     xyz_bias: 0.0
     max_sh_degree: 1
 
+  # Dynamic field MLP (only used when use_dynamic_field: True)
   next_mlp:
-    d_in: 3
-    d_lang: 128
-    d_out: 3
     n_blocks: 5
     d_hidden: 512
     combine_layer: 3

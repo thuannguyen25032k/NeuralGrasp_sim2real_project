@@ -23,7 +23,7 @@ eval_gpu=${3:-"0"}
 cur_dir=$(pwd)
 train_demo_path="${cur_dir}/data/train_data"
 test_demo_path="${cur_dir}/data/test_data"
-tasks="[light_bulb_in,put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,place_shape_in_shape_sorter,push_buttons,insert_onto_square_peg,stack_cups]"   # specify the task(s) to evaluate on; e.g. "[put_money_in_safe,place_cups]" or "all" for all tasks in the demo path
+tasks="[put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,insert_onto_square_peg,stack_cups]"   # specify the task(s) to evaluate on; e.g. "[put_money_in_safe,place_cups]" or "all" for all tasks in the demo path
 use_split='test'    # or 'train' for debugging
 
 starttime=`date +'%Y-%m-%d %H:%M:%S'`

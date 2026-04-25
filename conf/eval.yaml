@@ -14,12 +14,12 @@ rlbench:
     # train_cfg.rlbench.episode_length from the saved config.yaml so the
     # time-in-state encoding seen at eval exactly matches training.
     # This value is kept only as a human-readable reminder.
-    episode_length: 15   # for reference only; eval.py uses train_cfg value
+    episode_length: 20   # for reference only; eval.py uses train_cfg value
     cameras: [front]
     camera_resolution: [128, 128]
     scene_bounds: [-0.3, -0.5, 0.6, 0.7, 0.5, 1.6]
-    include_lang_goal_in_obs: True
-    time_in_state: True  # must match training; used directly by eval.py env_config
+    include_lang_goal_in_obs: True  # NOTE: ignored by eval.py — value is read from train config.yaml
+    time_in_state: True  # NOTE: ignored by eval.py — value is read from train config.yaml
     headless: True  # default
 
 framework:
@@ -37,7 +37,7 @@ framework:
     # start index
     eval_from_eps_number: 0
 
-    eval_episodes: 25
+    eval_episodes: 20
     # eval_type: 'missing' # default: 'missing'
     # eval_type: 'best' # please first run 'missing'
     eval_type: 'last'   # more convinience

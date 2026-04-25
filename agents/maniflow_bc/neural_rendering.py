@@ -86,6 +86,12 @@ class NeuralRenderer(nn.Module):
         else:
             cprint(f"foundation model {self.model_name} is not implemented", "yellow")
 
+        # Freeze foundation model — it's only used as a frozen feature extractor
+        if hasattr(self, 'feature_extractor'):
+            self.feature_extractor.eval()
+            for p in self.feature_extractor.parameters():
+                p.requires_grad_(False)
+
         self.lambda_embed = cfg.lambda_embed
         print(colored(f"[NeuralRenderer] foundation model {self.model_name} is build. loss weight: {self.lambda_embed}", "cyan"))
 
@@ -138,22 +144,25 @@ class NeuralRenderer(nn.Module):
             return grad
         return hook
 
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
     def _batched_pca(self, feat, in_channels):
         """
         PCA projection: (bs, C, H, W) → (bs, d_embed, H, W).
 
-        Uses torch.linalg.svd for a single fully-vectorised batched call,
-        which is faster and more numerically stable than the previous
-        torch.pca_lowrank loop (adopted from manigaussian_bc).
+        Uses torch.pca_lowrank (randomized SVD) which is O(N*C*q) instead of
+        O(N*C*min(N,C)) from full SVD — much faster when q << C (e.g. 6 vs 512).
+        Loops over the batch because pca_lowrank doesn't support batched input.
         """
         bs, C, H, W = feat.shape
         q = max(6, self.d_embed)
-        A = feat.reshape(bs, C, -1).permute(0, 2, 1).float()  # [bs, H*W, C]
-        A = A - A.mean(dim=1, keepdim=True)                    # centre columns
-        _, _, Vh = torch.linalg.svd(A, full_matrices=False)    # Vh: [bs, min(H*W,C), C]
-        V = Vh[:, :q, :].permute(0, 2, 1)                      # [bs, C, q]
-        proj = torch.bmm(A, V)[:, :, :self.d_embed]            # [bs, H*W, d_embed]
-        return proj.permute(0, 2, 1).reshape(bs, self.d_embed, H, W)
+        results = []
+        for i in range(bs):
+            A = feat[i].reshape(C, -1).permute(1, 0).float()   # [H*W, C]
+            A = A - A.mean(dim=0, keepdim=True)                 # centre columns
+            _, _, V = torch.pca_lowrank(A, q=q)                 # V: [C, q]
+            proj = A @ V[:, :self.d_embed]                      # [H*W, d_embed]
+            results.append(proj.permute(1, 0).reshape(self.d_embed, H, W))
+        return torch.stack(results, dim=0)                      # [bs, d_embed, H, W]
 
     def extract_foundation_model_feature(self, gt_rgb, lang_goal):
         """
@@ -334,8 +343,7 @@ class NeuralRenderer(nn.Module):
             psnr = PSNR_torch(render_novel, gt_rgb)
 
             loss = 0.
-            # loss_rgb = self.cfg.lambda_l1 * Ll1 + self.cfg.lambda_ssim * Lssim
-            loss_rgb = self.cfg.lambda_rgb * Ll1
+            loss_rgb = self.lambda_rgb * Ll1
             loss += loss_rgb
 
             if gt_embed is not None:
