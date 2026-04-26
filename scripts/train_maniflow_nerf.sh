@@ -41,9 +41,9 @@ echo "Log file: ${log_file}"
 # ---- Hyperparameters -------------------------------------------------------
 # SR-FIX NeRF#3: batch_size raised 4 → 6 so that (a) the grip BCE sees more
 # positive/negative samples per step (was only 4), and (b) the NeRF renderer
-# gets more view diversity per update.  6 fits comfortably in 48 GB with
+# gets more view diversity per update.  8 fits comfortably in 48 GB with
 # DINOv2 + dynamic field enabled (~30 GB estimated peak).
-batch_size=4
+batch_size=8
 tasks=[close_jar,open_drawer,sweep_to_dustpan_of_size,meat_off_grill,turn_tap,slide_block_to_color_target,put_item_in_drawer,reach_and_drag,push_buttons,stack_blocks]
 demo=100
 
@@ -85,7 +85,7 @@ train_cmd=(
     "rlbench.tasks=${tasks}"
     "rlbench.demos=${demo}"
     # ---- Enable neural rendering -------------------------------------------1
-    "method.use_neural_rendering=False"
+    "method.use_neural_rendering=True"
     "method.neural_renderer.foundation_model_name=diffusion"
 	"method.neural_renderer.use_dynamic_field=True"
     # ---- Optimizer ---------------------------------------------------------
