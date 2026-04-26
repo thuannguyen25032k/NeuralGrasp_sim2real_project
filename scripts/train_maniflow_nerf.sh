@@ -44,7 +44,7 @@ echo "Log file: ${log_file}"
 # gets more view diversity per update.  6 fits comfortably in 48 GB with
 # DINOv2 + dynamic field enabled (~30 GB estimated peak).
 batch_size=4
-tasks=[put_money_in_safe,place_wine_at_rack_location,put_groceries_in_cupboard,insert_onto_square_peg,stack_cups]
+tasks=[close_jar,open_drawer,sweep_to_dustpan_of_size,meat_off_grill,turn_tap,slide_block_to_color_target,put_item_in_drawer,reach_and_drag,push_buttons,stack_blocks]
 demo=100
 
 lr=0.0001
@@ -85,7 +85,7 @@ train_cmd=(
     "rlbench.tasks=${tasks}"
     "rlbench.demos=${demo}"
     # ---- Enable neural rendering -------------------------------------------1
-    "method.use_neural_rendering=True"
+    "method.use_neural_rendering=False"
     "method.neural_renderer.foundation_model_name=diffusion"
 	"method.neural_renderer.use_dynamic_field=True"
     # ---- Optimizer ---------------------------------------------------------

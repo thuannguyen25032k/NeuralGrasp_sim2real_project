@@ -182,32 +182,28 @@ def _add_keypoints_to_replay(
         cameras: List[str],
         description: str = '',
         language_model=None,
-        device='cpu',
-        initial_frame_idx: int = 0):
+        device='cpu'):
 
     prev_action = None
     obs = inital_obs    # Initial observation is 0
-    obs_frame_idx = initial_frame_idx   # absolute frame index of the current `obs` in the demo
 
     for k, keypoint in enumerate(episode_keypoints):    # demo[-1].nerf_multi_view_rgb is none 
         obs_tp1 = demo[keypoint]
         obs_tm1 = demo[max(0, keypoint - 1)]
 
         action = _get_action(obs_tp1)
-        # Use ignore_collisions from the current starting obs (matches eval,
-        # which reads it from the live observation dict at act() time).
-        ignore_collisions = int(obs.ignore_collisions)
 
         terminal = (k == len(episode_keypoints) - 1)
         reward = float(terminal) * REWARD_SCALE if terminal else 0
 
-        # Use the absolute frame index of the *current* obs (demo[prev_keypoint])
-        # as the time token, not the sparse keypoint counter k.
-        # `obs` is updated to obs_tp1 at the end of this loop, so after the
-        # first iteration obs = demo[episode_keypoints[k-1]].
-        # We track the frame index explicitly via `obs_frame_idx`.
+        # Time index = number of keypoint actions already taken so far in
+        # this (sub-)episode. We treat each demo-augmented start as a fresh
+        # episode beginning at t=0, matching eval semantics where `self._i`
+        # always starts at 0 regardless of starting state. The obs itself
+        # encodes the scene; we do NOT inject a phantom history via t.
+        # Matches manigaussian_bc reference.
         obs_dict = utils.extract_obs(
-            obs, t=obs_frame_idx, prev_action=prev_action,
+            obs, t=k, prev_action=prev_action,
             cameras=cameras,
             episode_length=cfg.rlbench.episode_length,
             next_obs=obs_tp1 if not terminal else obs_tm1,
@@ -233,11 +229,11 @@ def _add_keypoints_to_replay(
         timeout = False
         replay.add(action, reward, terminal, timeout, **others)
         obs = obs_tp1
-        obs_frame_idx = keypoint   # advance to absolute frame index of new obs
 
-    # Final step: obs is now demo[last_keypoint]; use its frame index
+    # Final (terminal) obs comes AFTER the last action, so its time index is
+    # (k + 1) where k is the last loop value = len(kps)-1.
     obs_dict_tp1 = utils.extract_obs(
-        obs_tp1, t=keypoint, prev_action=prev_action,
+        obs_tp1, t=k + 1, prev_action=prev_action,
         cameras=cameras,
         episode_length=cfg.rlbench.episode_length,
         next_obs=obs_tp1,
@@ -319,7 +315,6 @@ def fill_replay(cfg: DictConfig,
                 description=desc,
                 language_model=language_model,
                 device=device,
-                initial_frame_idx=i,
             )
 
     logging.debug('Replay %s filled with demos.' % task)

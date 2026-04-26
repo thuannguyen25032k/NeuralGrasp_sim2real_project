@@ -148,11 +148,13 @@ class CustomRLBenchEnv(RLBenchEnv):
                 reward *= self._reward_scale
             else:
                 reward = 0.0
+            self._i += 1  # increment BEFORE extract_obs so time token = i/L matches training
             obs = self.extract_obs(obs)
             self._previous_obs_dict = obs
         except (IKError, ConfigurationPathError, InvalidActionError) as e:
             terminal = True
             reward = 0.0
+            self._i += 1  # keep counter consistent on failure too
 
             if isinstance(e, IKError):
                 self._error_type_counts['IKError'] += 1
@@ -164,7 +166,6 @@ class CustomRLBenchEnv(RLBenchEnv):
             self._last_exception = e
 
         summaries = []
-        self._i += 1
         if ((terminal or self._i == self._episode_length) and
                 self._record_current_episode):
             self._append_final_frame(success)
